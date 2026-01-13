@@ -1,0 +1,14 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.21.0,<2.0.0
+biopython>=1.79
+einops>=0.6.0
+
+# Optional: Graph neural networks (for future GVP integration)
+# torch-geometric>=2.3.0
+
+# Optional: GVP (Geometric Vector Perceptron)
+# Note: GVP may need to be installed from GitHub:
+# pip install git+https://github.com/drorlab/gvp-pytorch.git
+# Or use: pip install gvp
+# gvp-pytorch
