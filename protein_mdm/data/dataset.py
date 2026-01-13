@@ -54,7 +54,9 @@ class ProteinStructureDataset(Dataset):
         self,
         pdb_files: Union[str, List[str]],
         vocab: Optional[FragmentVocab] = None,
-        use_mmcif: bool = False
+        use_mmcif: bool = False,
+        cache_dir: Optional[str] = None,
+        lazy_loading: bool = True
     ):
         """
         Initialize the dataset.
@@ -64,22 +66,41 @@ class ProteinStructureDataset(Dataset):
                       or list of PDB file paths
             vocab: FragmentVocab instance (if None, uses global singleton)
             use_mmcif: If True, use MMCIFParser instead of PDBParser
+            cache_dir: Optional directory to cache processed data (if None, no caching)
+            lazy_loading: If True, only load data when accessed (default: True)
         """
         self.vocab = vocab if vocab is not None else get_vocab()
         self.parser = MMCIFParser(QUIET=True) if use_mmcif else PDBParser(QUIET=True)
+        self.cache_dir = cache_dir
+        self.lazy_loading = lazy_loading
+        
+        # Create cache directory if specified
+        if self.cache_dir is not None:
+            os.makedirs(self.cache_dir, exist_ok=True)
         
         # Collect PDB files
         if isinstance(pdb_files, str):
             if os.path.isfile(pdb_files):
                 self.pdb_files = [pdb_files]
             elif os.path.isdir(pdb_files):
-                # Find all PDB/mmCIF files in directory
-                extensions = ['.pdb', '.cif'] if use_mmcif else ['.pdb']
-                self.pdb_files = [
-                    os.path.join(pdb_files, f)
-                    for f in os.listdir(pdb_files)
-                    if any(f.endswith(ext) for ext in extensions)
-                ]
+                # 如果指定了缓存目录且 pdb_files 就是缓存目录，查找 .pt 文件
+                # 否则查找 .pdb 或 .cif 文件
+                if cache_dir is not None and os.path.abspath(pdb_files) == os.path.abspath(cache_dir):
+                    # 使用缓存目录，查找 .pt 文件（排除划分文件）
+                    pt_files = [
+                        os.path.join(pdb_files, f)
+                        for f in os.listdir(pdb_files)
+                        if f.endswith('.pt') and f not in ['train.txt', 'val.txt', 'test.txt']
+                    ]
+                    self.pdb_files = pt_files
+                else:
+                    # 查找 PDB/mmCIF 文件
+                    extensions = ['.pdb', '.cif'] if use_mmcif else ['.pdb']
+                    self.pdb_files = [
+                        os.path.join(pdb_files, f)
+                        for f in os.listdir(pdb_files)
+                        if any(f.endswith(ext) for ext in extensions)
+                    ]
             else:
                 raise ValueError(f"Invalid path: {pdb_files}")
         else:
@@ -89,28 +110,78 @@ class ProteinStructureDataset(Dataset):
             raise ValueError("No PDB files found!")
         
         print(f"Initialized dataset with {len(self.pdb_files)} PDB files")
+        if self.cache_dir:
+            print(f"Cache directory: {self.cache_dir}")
     
     def __len__(self) -> int:
         """Return the number of samples in the dataset"""
         return len(self.pdb_files)
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def _get_cache_path(self, pdb_path: str) -> Optional[str]:
         """
-        Load and process a single protein structure.
+        获取缓存文件路径
         
         Args:
-            idx: Index of the PDB file to load
+            pdb_path: PDB 文件路径或缓存文件路径
         
         Returns:
-            Dictionary containing:
-            - 'backbone_coords': Tensor [L, 4, 3]
-            - 'fragment_token_ids': Tensor [M]
-            - 'torsion_bins': Tensor [K]
-            - 'residue_types': List of residue names (for debugging)
-            - 'sequence_length': Scalar tensor with sequence length L
+            缓存文件路径，如果 cache_dir 为 None 则返回 None
         """
-        pdb_path = self.pdb_files[idx]
+        if self.cache_dir is None:
+            return None
         
+        # 如果 pdb_path 已经是 .pt 文件，直接返回
+        if pdb_path.endswith('.pt'):
+            return pdb_path
+        
+        # 从 PDB 路径提取文件名（不含扩展名）
+        pdb_name = os.path.splitext(os.path.basename(pdb_path))[0]
+        cache_path = os.path.join(self.cache_dir, f"{pdb_name}.pt")
+        return cache_path
+    
+    def _load_from_cache(self, cache_path: str) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        从缓存加载数据
+        
+        Args:
+            cache_path: 缓存文件路径
+        
+        Returns:
+            数据字典，如果文件不存在则返回 None
+        """
+        if not os.path.exists(cache_path):
+            return None
+        
+        try:
+            data = torch.load(cache_path, map_location='cpu')
+            return data
+        except Exception as e:
+            print(f"Warning: Failed to load cache {cache_path}: {e}")
+            return None
+    
+    def _save_to_cache(self, cache_path: str, data: Dict[str, torch.Tensor]):
+        """
+        保存数据到缓存
+        
+        Args:
+            cache_path: 缓存文件路径
+            data: 要保存的数据字典
+        """
+        try:
+            torch.save(data, cache_path)
+        except Exception as e:
+            print(f"Warning: Failed to save cache {cache_path}: {e}")
+    
+    def _parse_pdb_file(self, pdb_path: str) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        解析 PDB 文件并返回处理后的数据
+        
+        Args:
+            pdb_path: PDB 文件路径
+        
+        Returns:
+            数据字典，如果解析失败则返回 None
+        """
         try:
             # Parse PDB file
             structure = self.parser.get_structure('protein', pdb_path)
@@ -122,6 +193,10 @@ class ProteinStructureDataset(Dataset):
             # Extract backbone coordinates and side-chain information
             backbone_coords, fragment_tokens, torsion_angles, residue_types = \
                 self._extract_structure_data(chain)
+            
+            # 检查是否成功提取数据
+            if len(backbone_coords) == 0:
+                return None
             
             # Convert to tensors
             backbone_tensor = torch.tensor(backbone_coords, dtype=torch.float32)
@@ -139,7 +214,7 @@ class ProteinStructureDataset(Dataset):
             else:
                 torsion_tensor = torch.tensor([], dtype=torch.long)
             
-            return {
+            data = {
                 'backbone_coords': backbone_tensor,
                 'fragment_token_ids': fragment_tensor,
                 'torsion_bins': torsion_tensor,
@@ -147,18 +222,58 @@ class ProteinStructureDataset(Dataset):
                 'sequence_length': torch.tensor(len(backbone_coords), dtype=torch.long),
                 'pdb_path': pdb_path
             }
+            
+            return data
         
         except Exception as e:
-            print(f"Error loading {pdb_path}: {e}")
-            # Return empty tensors on error (could also raise or skip)
-            return {
-                'backbone_coords': torch.zeros((0, 4, 3), dtype=torch.float32),
-                'fragment_token_ids': torch.tensor([], dtype=torch.long),
-                'torsion_bins': torch.tensor([], dtype=torch.long),
-                'residue_types': [],
-                'sequence_length': torch.tensor(0, dtype=torch.long),
-                'pdb_path': pdb_path
-            }
+            # 解析失败，返回 None
+            return None
+    
+    def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        Load and process a single protein structure.
+        
+        Args:
+            idx: Index of the PDB file to load
+        
+        Returns:
+            Dictionary containing:
+            - 'backbone_coords': Tensor [L, 4, 3]
+            - 'fragment_token_ids': Tensor [M]
+            - 'torsion_bins': Tensor [K]
+            - 'residue_types': List of residue names (for debugging)
+            - 'sequence_length': Scalar tensor with sequence length L
+            - 'pdb_path': Original PDB file path
+            
+            If parsing fails, returns None (will be filtered by collate_fn)
+        """
+        pdb_path = self.pdb_files[idx]
+        
+        # 如果 pdb_path 已经是 .pt 文件（缓存文件），直接加载
+        if pdb_path.endswith('.pt'):
+            cached_data = self._load_from_cache(pdb_path)
+            if cached_data is not None:
+                return cached_data
+            else:
+                # 缓存文件损坏，返回 None
+                return None
+        
+        # 检查缓存
+        cache_path = self._get_cache_path(pdb_path)
+        if cache_path is not None:
+            cached_data = self._load_from_cache(cache_path)
+            if cached_data is not None:
+                return cached_data
+        
+        # 缓存未命中，解析 PDB 文件
+        data = self._parse_pdb_file(pdb_path)
+        
+        # 如果解析成功，保存到缓存
+        if data is not None and cache_path is not None:
+            self._save_to_cache(cache_path, data)
+        
+        # 如果解析失败，返回 None（会被 collate_fn 过滤）
+        return data
     
     def _extract_structure_data(
         self,
@@ -279,24 +394,39 @@ class ProteinStructureDataset(Dataset):
         return torsion_angles
 
 
-def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torch.Tensor]:
     """
     Custom collate function for batching variable-length protein sequences.
     
     This function pads sequences to the same length for batch processing.
+    It also filters out None samples (failed parsing) to prevent DataLoader crashes.
     
     Args:
-        batch: List of samples from the dataset
+        batch: List of samples from the dataset (may contain None for failed samples)
     
     Returns:
         Batched dictionary with padded tensors
     """
-    # Find maximum sequence length
-    max_seq_len = max(item['sequence_length'].item() for item in batch)
-    max_fragments = max(len(item['fragment_token_ids']) for item in batch)
-    max_torsions = max(len(item['torsion_bins']) for item in batch)
+    # 过滤掉 None 样本（解析失败的样本）
+    valid_batch = [item for item in batch if item is not None]
     
-    batch_size = len(batch)
+    if len(valid_batch) == 0:
+        # 如果所有样本都失败，返回空批次
+        return {
+            'backbone_coords': torch.zeros((0, 1, 4, 3), dtype=torch.float32),
+            'fragment_token_ids': torch.zeros((0, 1), dtype=torch.long),
+            'torsion_bins': torch.zeros((0, 1), dtype=torch.long),
+            'sequence_lengths': torch.zeros(0, dtype=torch.long),
+            'residue_types': [],
+            'pdb_paths': []
+        }
+    
+    # Find maximum sequence length
+    max_seq_len = max(item['sequence_length'].item() for item in valid_batch)
+    max_fragments = max(len(item['fragment_token_ids']) for item in valid_batch)
+    max_torsions = max(len(item['torsion_bins']) for item in valid_batch)
+    
+    batch_size = len(valid_batch)
     
     # Initialize batched tensors
     backbone_batch = torch.zeros(
@@ -314,7 +444,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     seq_lengths = torch.zeros(batch_size, dtype=torch.long)
     
     # Fill in the batch
-    for i, item in enumerate(batch):
+    for i, item in enumerate(valid_batch):
         seq_len = item['sequence_length'].item()
         frag_len = len(item['fragment_token_ids'])
         tors_len = len(item['torsion_bins'])
@@ -329,8 +459,8 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         'fragment_token_ids': fragment_batch,
         'torsion_bins': torsion_batch,
         'sequence_lengths': seq_lengths,
-        'residue_types': [item['residue_types'] for item in batch],
-        'pdb_paths': [item['pdb_path'] for item in batch]
+        'residue_types': [item['residue_types'] for item in valid_batch],
+        'pdb_paths': [item['pdb_path'] for item in valid_batch]
     }
 
 

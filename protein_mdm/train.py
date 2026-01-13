@@ -23,11 +23,13 @@ def main():
     
     # 数据参数
     parser.add_argument("--pdb_path", type=str, required=True,
-                       help="PDB 文件路径或目录")
+                       help="PDB 文件路径或目录（或缓存目录）")
+    parser.add_argument("--cache_dir", type=str, default=None,
+                       help="缓存目录（如果提供，将使用缓存加速加载）")
     parser.add_argument("--batch_size", type=int, default=4,
                        help="批次大小")
     parser.add_argument("--val_split", type=float, default=0.1,
-                       help="验证集比例")
+                       help="验证集比例（如果使用预处理的数据集划分，则忽略此参数）")
     
     # 模型参数
     parser.add_argument("--hidden_dim", type=int, default=256,
@@ -79,8 +81,13 @@ def main():
     
     # 加载数据集
     print("\n1. 加载数据集...")
-    dataset = ProteinStructureDataset(args.pdb_path)
+    dataset = ProteinStructureDataset(
+        args.pdb_path,
+        cache_dir=args.cache_dir
+    )
     print(f"   数据集大小: {len(dataset)}")
+    if args.cache_dir:
+        print(f"   使用缓存目录: {args.cache_dir}")
     
     # 划分训练/验证集
     if args.val_split > 0:
