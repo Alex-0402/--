@@ -84,7 +84,12 @@ def main():
     print("\n4. Testing model forward pass...")
     dummy_backbone = torch.randn(1, 10, 4, 3)  # batch_size=1, seq_len=10
     node_embeddings = encoder(dummy_backbone)
-    frag_logits, tors_logits = decoder(node_embeddings)
+    # 创建目标片段序列（Token IDs）
+    target_fragments = torch.randint(0, vocab.get_vocab_size(), (1, 15))
+    frag_logits, tors_logits = decoder(
+        node_embeddings=node_embeddings,
+        target_fragments=target_fragments
+    )
     print(f"   Input backbone shape: {dummy_backbone.shape}")
     print(f"   Node embeddings shape: {node_embeddings.shape}")
     print(f"   Fragment logits shape: {frag_logits.shape}")
@@ -123,11 +128,7 @@ def main():
     print("\n" + "="*60)
     print("Initialization complete!")
     print("="*60)
-    print("\nNext steps:")
-    print("  1. Implement GVP-based encoder for SE(3) equivariance")
-    print("  2. Implement masked diffusion training loop")
-    print("  3. Implement adaptive inference strategy")
-    print("  4. Train on protein structure dataset")
+    print("\n模型架构已就绪，可以开始训练和推理。")
 
 
 if __name__ == "__main__":
