@@ -30,6 +30,47 @@ from data.vocabulary import get_vocab
 from training.trainer import Trainer
 
 
+def load_train_val_splits(cache_dir: str):
+    """
+    从缓存目录加载预定义的训练集和验证集
+    
+    Args:
+        cache_dir: 缓存目录路径
+        
+    Returns:
+        (train_paths, val_paths) 元组，如果文件不存在则返回 (None, None)
+    """
+    train_file = os.path.join(cache_dir, 'train.txt')
+    val_file = os.path.join(cache_dir, 'val.txt')
+    
+    train_paths = None
+    val_paths = None
+    
+    # 加载训练集
+    if os.path.exists(train_file):
+        with open(train_file, 'r') as f:
+            train_files = [line.strip() for line in f if line.strip()]
+        # 构建完整的缓存文件路径
+        train_paths = [
+            os.path.join(cache_dir, f"{name}.pt")
+            for name in train_files
+            if os.path.exists(os.path.join(cache_dir, f"{name}.pt"))
+        ]
+    
+    # 加载验证集
+    if os.path.exists(val_file):
+        with open(val_file, 'r') as f:
+            val_files = [line.strip() for line in f if line.strip()]
+        # 构建完整的缓存文件路径
+        val_paths = [
+            os.path.join(cache_dir, f"{name}.pt")
+            for name in val_files
+            if os.path.exists(os.path.join(cache_dir, f"{name}.pt"))
+        ]
+    
+    return train_paths, val_paths
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="训练蛋白质侧链设计模型"
@@ -43,7 +84,9 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4,
                        help="批次大小")
     parser.add_argument("--val_split", type=float, default=0.1,
-                       help="验证集比例（如果使用预处理的数据集划分，则忽略此参数）")
+                       help="验证集比例（如果使用预定义划分，则忽略此参数）")
+    parser.add_argument("--use_predefined_split", action="store_true",
+                       help="使用预定义的 train.txt 和 val.txt 划分（如果存在）")
     
     # 模型参数
     parser.add_argument("--hidden_dim", type=int, default=256,
@@ -143,27 +186,69 @@ def main():
     # 加载数据集
     if rank == 0:
         print("\n1. 加载数据集...")
-    dataset = ProteinStructureDataset(
-        args.pdb_path,
-        cache_dir=args.cache_dir
-    )
-    if rank == 0:
-        print(f"   数据集大小: {len(dataset)}")
-        if args.cache_dir:
-            print(f"   使用缓存目录: {args.cache_dir}")
     
-    # 划分训练/验证集
-    if args.val_split > 0:
-        val_size = int(len(dataset) * args.val_split)
-        train_size = len(dataset) - val_size
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            dataset, [train_size, val_size]
+    # 尝试使用预定义的划分
+    # 如果指定了 --use_predefined_split，或者 cache_dir 存在且包含 train.txt 和 val.txt，则使用预定义划分
+    use_predefined = args.use_predefined_split
+    train_paths = None
+    val_paths = None
+    
+    if args.cache_dir:
+        train_paths, val_paths = load_train_val_splits(args.cache_dir)
+        if train_paths is not None and val_paths is not None and len(train_paths) > 0 and len(val_paths) > 0:
+            # 如果找到了预定义划分，自动使用（除非明确指定不使用）
+            if not args.use_predefined_split:
+                # 自动检测：如果存在预定义文件，默认使用
+                use_predefined = True
+            if rank == 0:
+                print(f"   ✅ 使用预定义的数据集划分")
+                print(f"   训练集文件: {len(train_paths)} 个")
+                print(f"   验证集文件: {len(val_paths)} 个")
+        else:
+            if args.use_predefined_split:
+                if rank == 0:
+                    print(f"   ⚠️  预定义划分文件不存在，将使用随机划分")
+                use_predefined = False
+            else:
+                use_predefined = False
+    
+    # 根据是否使用预定义划分来加载数据集
+    if use_predefined and train_paths is not None and val_paths is not None:
+        # 使用预定义的划分
+        train_dataset = ProteinStructureDataset(
+            train_paths,
+            cache_dir=args.cache_dir
+        )
+        val_dataset = ProteinStructureDataset(
+            val_paths,
+            cache_dir=args.cache_dir
         )
         if rank == 0:
-            print(f"   训练集: {len(train_dataset)}, 验证集: {len(val_dataset)}")
+            print(f"   训练集: {len(train_dataset)} 个样本")
+            print(f"   验证集: {len(val_dataset)} 个样本")
     else:
-        train_dataset = dataset
-        val_dataset = None
+        # 使用随机划分或全部数据
+        dataset = ProteinStructureDataset(
+            args.pdb_path,
+            cache_dir=args.cache_dir
+        )
+        if rank == 0:
+            print(f"   数据集大小: {len(dataset)}")
+            if args.cache_dir:
+                print(f"   使用缓存目录: {args.cache_dir}")
+        
+        # 划分训练/验证集
+        if args.val_split > 0:
+            val_size = int(len(dataset) * args.val_split)
+            train_size = len(dataset) - val_size
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                dataset, [train_size, val_size]
+            )
+            if rank == 0:
+                print(f"   训练集: {len(train_dataset)}, 验证集: {len(val_dataset)} (随机划分)")
+        else:
+            train_dataset = dataset
+            val_dataset = None
     
     # 创建数据加载器
     train_sampler = None
