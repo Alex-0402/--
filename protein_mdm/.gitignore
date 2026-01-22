@@ -20,11 +20,16 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environment
+# Virtual Environment (legacy)
 venv/
 env/
 ENV/
 .venv
+
+# Conda Environment
+.conda/
+.conda_env/
+.conda_pkgs/
 
 # IDE
 .vscode/

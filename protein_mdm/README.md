@@ -62,31 +62,47 @@ protein_mdm/
 
 ## 安装
 
-### 1. 创建虚拟环境（推荐）
-
-使用虚拟环境可以隔离项目依赖，避免与系统 Python 或其他项目冲突：
+### 1. 安装 Miniconda（如果尚未安装）
 
 ```bash
-# 创建虚拟环境
-python3 -m venv venv
+# 下载 Miniconda（使用清华镜像，速度更快）
+wget https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-x86_64.sh
 
-# 激活虚拟环境
-# macOS/Linux:
-source venv/bin/activate
+# 安装（按照提示操作）
+bash Miniconda3-latest-Linux-x86_64.sh
 
-# Windows:
-# venv\Scripts\activate
+# 重新加载 shell 配置
+source ~/.bashrc
 ```
 
-### 2. 安装依赖
+### 2. 创建 Conda 环境
+
+使用自动配置脚本（推荐）：
 
 ```bash
-# 确保虚拟环境已激活，然后安装核心依赖
-pip install --upgrade pip
-pip install -r requirements.txt
+bash setup_env.sh
+```
 
-# 可选：安装高级功能依赖（GVP、torch-geometric 等）
-# pip install -r requirements-optional.txt
+脚本会自动：
+- ✅ 配置 Conda 和 pip 使用**清华镜像源**（加速下载）
+- ✅ 创建 Conda 环境
+- ✅ 安装所有依赖
+
+或手动创建：
+
+```bash
+# 先配置镜像源（可选，但推荐）
+bash configure_mirrors.sh
+
+# 创建环境
+conda create -n protein_mdm python=3.10 -y
+
+# 激活环境
+conda activate protein_mdm
+
+# 安装依赖（使用清华源）
+pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 **注意**：
@@ -94,13 +110,15 @@ pip install -r requirements.txt
 - `torch-geometric` 是必需的（用于几何 GNN 编码器）
 - 确保已安装所有依赖后再运行代码
 
-### 3. 退出虚拟环境
+### 4. 退出环境
 
 ```bash
-deactivate
+conda deactivate
 ```
 
-**注意**：每次使用项目时，记得先激活虚拟环境！
+**注意**：每次使用项目时，记得先激活 Conda 环境！
+
+**详细配置指南**: 查看 [ENV_SETUP.md](ENV_SETUP.md)
 
 ## 使用方法
 

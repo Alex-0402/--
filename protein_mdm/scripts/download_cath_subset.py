@@ -32,8 +32,13 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 
+# CATH 列表文件下载 URL（按优先级排序）
+# 优先尝试 PKU 镜像（国内/亚洲极快）
+CATH_LIST_URL_MIRROR = "http://ftp.cbi.pku.edu.cn/pub/mirror/CATH/non-redundant-data-sets/cath-dataset-nonredundant-S40.list"
+
 # CATH 官方 URL（尝试多个可能的 URL）
 CATH_S40_LIST_URLS = [
+    CATH_LIST_URL_MIRROR,  # 优先使用 PKU 镜像
     "https://www.cathdb.info/download/by_release/latest-release/non-redundant-data-sets/cath-dataset-nonredundant-S40.list",
     "http://download.cathdb.info/cath/releases/latest-release/non-redundant-data-sets/cath-dataset-nonredundant-S40.list",
     "https://download.cathdb.info/cath/releases/latest-release/non-redundant-data-sets/cath-dataset-nonredundant-S40.list",
@@ -52,7 +57,7 @@ HEADERS = {
 }
 
 
-def download_file(url: str, output_path: str, timeout: int = 30, headers: Optional[dict] = None) -> bool:
+def download_file(url: str, output_path: str, timeout: int = 30, headers: Optional[dict] = None, verify_ssl: bool = True) -> bool:
     """
     下载文件到指定路径
     
@@ -61,6 +66,7 @@ def download_file(url: str, output_path: str, timeout: int = 30, headers: Option
         output_path: 输出文件路径
         timeout: 超时时间（秒）
         headers: HTTP 请求头（可选）
+        verify_ssl: 是否验证 SSL 证书（默认: True，HTTP URL 自动跳过）
     
     Returns:
         是否下载成功
@@ -69,7 +75,11 @@ def download_file(url: str, output_path: str, timeout: int = 30, headers: Option
         if headers is None:
             headers = HEADERS
         
-        response = requests.get(url, timeout=timeout, stream=True, headers=headers)
+        # HTTP URL 不需要 SSL 验证
+        if url.startswith('http://'):
+            verify_ssl = False
+        
+        response = requests.get(url, timeout=timeout, stream=True, headers=headers, verify=verify_ssl)
         response.raise_for_status()
         
         # 确保输出目录存在
@@ -106,7 +116,10 @@ def download_cath_list(output_path: str) -> bool:
     
     # 尝试多个 URL
     for i, url in enumerate(CATH_S40_LIST_URLS, 1):
-        print(f"  尝试 URL {i}/{len(CATH_S40_LIST_URLS)}: {url}")
+        if url == CATH_LIST_URL_MIRROR:
+            print(f"  尝试 URL {i}/{len(CATH_S40_LIST_URLS)}: {url} (PKU 镜像 - 国内/亚洲极快)")
+        else:
+            print(f"  尝试 URL {i}/{len(CATH_S40_LIST_URLS)}: {url}")
         success = download_file(url, output_path, headers=HEADERS)
         
         if success:

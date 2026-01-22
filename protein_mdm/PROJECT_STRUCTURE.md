@@ -21,7 +21,7 @@ protein_mdm/
 │   ├── __init__.py           # 模块导出
 │   └── protein_utils.py      # Biopython 辅助函数
 │
-├── venv/                      # Python 虚拟环境（不提交到 Git）
+├── environment.yml            # Conda 环境配置文件（可选）
 │
 ├── __init__.py                # 包初始化文件
 ├── main.py                    # 项目主入口

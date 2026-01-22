@@ -4,11 +4,11 @@
 
 ## 🚀 快速开始
 
-### 1. 激活虚拟环境
+### 1. 激活 Conda 环境
 
 ```bash
-cd /Users/ljh/Desktop/毕设/protein_mdm
-source venv/bin/activate
+cd /home/Oliver-0402/--/protein_mdm
+conda activate protein_mdm
 ```
 
 ### 2. 运行综合测试（推荐）

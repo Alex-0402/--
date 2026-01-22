@@ -82,8 +82,8 @@
 ### 基本测试（不需要 PDB 文件）
 
 ```bash
-cd /Users/ljh/Desktop/毕设/protein_mdm
-source venv/bin/activate
+cd /home/Oliver-0402/--/protein_mdm
+conda activate protein_mdm
 python test_all.py
 ```
 

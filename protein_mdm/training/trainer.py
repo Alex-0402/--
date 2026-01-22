@@ -39,14 +39,16 @@ class Trainer:
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
         mask_ratio: float = 0.15,
-        masking_strategy: str = "random"
+        masking_strategy: str = "random",
+        ddp_enabled: bool = False,
+        rank: int = 0
     ):
         """
         初始化训练器
         
         Args:
-            encoder: BackboneEncoder 实例
-            decoder: FragmentDecoder 实例
+            encoder: BackboneEncoder 实例（可能是 DDP 包装的）
+            decoder: FragmentDecoder 实例（可能是 DDP 包装的）
             train_loader: 训练数据加载器
             val_loader: 验证数据加载器（可选）
             device: 设备（默认：自动检测）
@@ -54,6 +56,8 @@ class Trainer:
             weight_decay: 权重衰减
             mask_ratio: 掩码比例
             masking_strategy: 掩码策略
+            ddp_enabled: 是否启用 DDP
+            rank: 当前进程的 rank（用于打印）
         """
         self.encoder = encoder
         self.decoder = decoder
@@ -64,12 +68,14 @@ class Trainer:
         )
         self.mask_ratio = mask_ratio
         self.masking_strategy = masking_strategy
+        self.ddp_enabled = ddp_enabled
+        self.rank = rank
         
-        # 移动到设备
-        self.encoder.to(self.device)
-        self.decoder.to(self.device)
+        # 检查是否是 DDP 模型
+        self.is_ddp_encoder = hasattr(encoder, 'module')
+        self.is_ddp_decoder = hasattr(decoder, 'module')
         
-        # 优化器
+        # 优化器（DDP 模型会自动处理参数收集）
         self.optimizer = optim.AdamW(
             list(self.encoder.parameters()) + list(self.decoder.parameters()),
             lr=learning_rate,
@@ -266,7 +272,8 @@ class Trainer:
             
             # 检查损失是否为 NaN 或 Inf
             if torch.isnan(losses['total_loss']) or torch.isinf(losses['total_loss']):
-                print(f"  ⚠️  警告: 训练批次 {num_batches} 的损失为 NaN/Inf，跳过")
+                if self.rank == 0:
+                    print(f"  ⚠️  警告: 训练批次 {num_batches} 的损失为 NaN/Inf，跳过")
                 self.optimizer.zero_grad()  # 清除梯度
                 continue
             
@@ -324,7 +331,8 @@ class Trainer:
                 
                 # 检查输入数据
                 if torch.isnan(backbone_coords).any() or torch.isinf(backbone_coords).any():
-                    print(f"  ⚠️  警告: backbone_coords 包含 NaN/Inf，跳过此批次")
+                    if self.rank == 0:
+                        print(f"  ⚠️  警告: backbone_coords 包含 NaN/Inf，跳过此批次")
                     continue
                 
                 # 创建掩码
@@ -341,7 +349,8 @@ class Trainer:
                 try:
                     node_embeddings = self.encoder(backbone_coords, mask=None)
                     if torch.isnan(node_embeddings).any() or torch.isinf(node_embeddings).any():
-                        print(f"  ⚠️  警告: encoder 输出包含 NaN/Inf，跳过此批次")
+                        if self.rank == 0:
+                            print(f"  ⚠️  警告: encoder 输出包含 NaN/Inf，跳过此批次")
                         continue
                     
                     try:
@@ -351,23 +360,27 @@ class Trainer:
                             sequence_lengths=sequence_lengths
                         )
                     except Exception as e:
-                        print(f"  ⚠️  警告: decoder 前向传播失败: {e}，跳过此批次")
-                        import traceback
-                        traceback.print_exc()
+                        if self.rank == 0:
+                            print(f"  ⚠️  警告: decoder 前向传播失败: {e}，跳过此批次")
+                            import traceback
+                            traceback.print_exc()
                         continue
                     
                     if torch.isnan(frag_logits).any() or torch.isinf(frag_logits).any():
-                        print(f"  ⚠️  警告: fragment_logits 包含 NaN/Inf，跳过此批次")
-                        print(f"      NaN 数量: {torch.isnan(frag_logits).sum().item()}, Inf 数量: {torch.isinf(frag_logits).sum().item()}")
-                        print(f"      Fragment logits 统计: min={frag_logits.min().item():.4f}, max={frag_logits.max().item():.4f}, mean={frag_logits.mean().item():.4f}")
-                        print(f"      Node embeddings 统计: min={node_embeddings.min().item():.4f}, max={node_embeddings.max().item():.4f}, mean={node_embeddings.mean().item():.4f}")
-                        print(f"      Masked fragments 范围: min={masked_fragments.min().item()}, max={masked_fragments.max().item()}")
+                        if self.rank == 0:
+                            print(f"  ⚠️  警告: fragment_logits 包含 NaN/Inf，跳过此批次")
+                            print(f"      NaN 数量: {torch.isnan(frag_logits).sum().item()}, Inf 数量: {torch.isinf(frag_logits).sum().item()}")
+                            print(f"      Fragment logits 统计: min={frag_logits.min().item():.4f}, max={frag_logits.max().item():.4f}, mean={frag_logits.mean().item():.4f}")
+                            print(f"      Node embeddings 统计: min={node_embeddings.min().item():.4f}, max={node_embeddings.max().item():.4f}, mean={node_embeddings.mean().item():.4f}")
+                            print(f"      Masked fragments 范围: min={masked_fragments.min().item()}, max={masked_fragments.max().item()}")
                         continue
                     if torch.isnan(tors_logits).any() or torch.isinf(tors_logits).any():
-                        print(f"  ⚠️  警告: torsion_logits 包含 NaN/Inf，跳过此批次")
+                        if self.rank == 0:
+                            print(f"  ⚠️  警告: torsion_logits 包含 NaN/Inf，跳过此批次")
                         continue
                 except Exception as e:
-                    print(f"  ⚠️  警告: 前向传播失败: {e}，跳过此批次")
+                    if self.rank == 0:
+                        print(f"  ⚠️  警告: 前向传播失败: {e}，跳过此批次")
                     continue
                 
                 # 计算损失
@@ -379,13 +392,14 @@ class Trainer:
                 
                 # 检查损失是否为 NaN 或 Inf
                 if torch.isnan(losses['total_loss']) or torch.isinf(losses['total_loss']):
-                    print(f"  ⚠️  警告: 批次 {num_batches} 的损失为 NaN/Inf，跳过")
-                    print(f"      Fragment loss: {losses['fragment_loss']}")
-                    print(f"      Torsion loss: {losses['torsion_loss']}")
-                    print(f"      Fragment logits shape: {frag_logits.shape}, contains NaN: {torch.isnan(frag_logits).any()}")
-                    print(f"      Torsion logits shape: {tors_logits.shape}, contains NaN: {torch.isnan(tors_logits).any()}")
-                    print(f"      Fragment targets shape: {fragment_token_ids.shape}, min: {fragment_token_ids.min()}, max: {fragment_token_ids.max()}")
-                    print(f"      Torsion targets shape: {torsion_bins.shape}, min: {torsion_bins.min()}, max: {torsion_bins.max()}")
+                    if self.rank == 0:
+                        print(f"  ⚠️  警告: 批次 {num_batches} 的损失为 NaN/Inf，跳过")
+                        print(f"      Fragment loss: {losses['fragment_loss']}")
+                        print(f"      Torsion loss: {losses['torsion_loss']}")
+                        print(f"      Fragment logits shape: {frag_logits.shape}, contains NaN: {torch.isnan(frag_logits).any()}")
+                        print(f"      Torsion logits shape: {tors_logits.shape}, contains NaN: {torch.isnan(tors_logits).any()}")
+                        print(f"      Fragment targets shape: {fragment_token_ids.shape}, min: {fragment_token_ids.min()}, max: {fragment_token_ids.max()}")
+                        print(f"      Torsion targets shape: {torsion_bins.shape}, min: {torsion_bins.min()}, max: {torsion_bins.max()}")
                     continue
                 
                 total_loss += losses['total_loss'].item()
@@ -404,7 +418,8 @@ class Trainer:
         
         # 如果平均值是 NaN，返回空字典（表示验证失败）
         if (avg_loss != avg_loss) or (avg_frag_loss != avg_frag_loss) or (avg_tors_loss != avg_tors_loss):
-            print(f"  ⚠️  警告: 验证损失为 NaN，可能是数据问题")
+            if self.rank == 0:
+                print(f"  ⚠️  警告: 验证损失为 NaN，可能是数据问题")
             return {}
         
         return {
@@ -417,7 +432,8 @@ class Trainer:
         self,
         num_epochs: int,
         save_dir: Optional[str] = None,
-        save_every: int = 10
+        save_every: int = 10,
+        train_sampler: Optional[torch.utils.data.Sampler] = None
     ):
         """
         训练模型
@@ -426,24 +442,32 @@ class Trainer:
             num_epochs: 训练轮数
             save_dir: 保存目录
             save_every: 每 N 个 epoch 保存一次
+            train_sampler: 训练采样器（DDP 时使用 DistributedSampler）
         """
-        if save_dir:
+        if save_dir and self.rank == 0:
             os.makedirs(save_dir, exist_ok=True)
         
-        print(f"开始训练，设备: {self.device}")
-        print(f"掩码策略: {self.masking_strategy}, 掩码比例: {self.mask_ratio}")
+        if self.rank == 0:
+            print(f"开始训练，设备: {self.device}")
+            print(f"掩码策略: {self.masking_strategy}, 掩码比例: {self.mask_ratio}")
         
         for epoch in range(1, num_epochs + 1):
-            print(f"\nEpoch {epoch}/{num_epochs}")
-            print("-" * 60)
+            # DDP 模式下，每个 epoch 需要设置 sampler 的 epoch
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            
+            if self.rank == 0:
+                print(f"\nEpoch {epoch}/{num_epochs}")
+                print("-" * 60)
             
             # 训练
             train_metrics = self.train_epoch()
             self.train_losses.append(train_metrics)
             
-            print(f"Train Loss: {train_metrics['loss']:.4f} "
-                  f"(Fragment: {train_metrics['fragment_loss']:.4f}, "
-                  f"Torsion: {train_metrics['torsion_loss']:.4f})")
+            if self.rank == 0:
+                print(f"Train Loss: {train_metrics['loss']:.4f} "
+                      f"(Fragment: {train_metrics['fragment_loss']:.4f}, "
+                      f"Torsion: {train_metrics['torsion_loss']:.4f})")
             
             # 验证
             if self.val_loader is not None:
@@ -452,35 +476,38 @@ class Trainer:
                 
                 # 只有当验证指标不为空时才处理
                 if val_metrics:
-                    print(f"Val Loss: {val_metrics['loss']:.4f} "
-                          f"(Fragment: {val_metrics['fragment_loss']:.4f}, "
-                          f"Torsion: {val_metrics['torsion_loss']:.4f})")
+                    if self.rank == 0:
+                        print(f"Val Loss: {val_metrics['loss']:.4f} "
+                              f"(Fragment: {val_metrics['fragment_loss']:.4f}, "
+                              f"Torsion: {val_metrics['torsion_loss']:.4f})")
                     
                     # 更新学习率
                     self.scheduler.step(val_metrics['loss'])
                     
-                    # 保存最佳模型
+                    # 保存最佳模型（只在 rank 0 保存）
                     if val_metrics['loss'] < self.best_val_loss:
                         self.best_val_loss = val_metrics['loss']
-                        if save_dir:
+                        if save_dir and self.rank == 0:
                             self.save_checkpoint(
                                 os.path.join(save_dir, 'best_model.pt'),
                                 epoch, val_metrics['loss']
                             )
                             print(f"✅ 保存最佳模型 (val_loss: {val_metrics['loss']:.4f})")
                 else:
-                    print("⚠️  验证集为空，跳过验证")
+                    if self.rank == 0:
+                        print("⚠️  验证集为空，跳过验证")
             
-            # 定期保存
-            if save_dir and epoch % save_every == 0:
+            # 定期保存（只在 rank 0 保存）
+            if save_dir and epoch % save_every == 0 and self.rank == 0:
                 self.save_checkpoint(
                     os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pt'),
                     epoch, train_metrics['loss']
                 )
         
-        print("\n" + "=" * 60)
-        print("训练完成！")
-        print("=" * 60)
+        if self.rank == 0:
+            print("\n" + "=" * 60)
+            print("训练完成！")
+            print("=" * 60)
     
     def save_checkpoint(
         self,
@@ -489,10 +516,14 @@ class Trainer:
         loss: float
     ):
         """保存检查点"""
+        # 如果是 DDP 模型，需要从 module 中获取 state_dict
+        encoder_state_dict = self.encoder.module.state_dict() if self.is_ddp_encoder else self.encoder.state_dict()
+        decoder_state_dict = self.decoder.module.state_dict() if self.is_ddp_decoder else self.decoder.state_dict()
+        
         torch.save({
             'epoch': epoch,
-            'encoder_state_dict': self.encoder.state_dict(),
-            'decoder_state_dict': self.decoder.state_dict(),
+            'encoder_state_dict': encoder_state_dict,
+            'decoder_state_dict': decoder_state_dict,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'loss': loss,
