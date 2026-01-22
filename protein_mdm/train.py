@@ -3,9 +3,20 @@
 
 使用方法:
     python train.py --pdb_path data/pdb_files --epochs 50 --batch_size 4
+    或者:
+    python -m train --pdb_path data/pdb_files --epochs 50 --batch_size 4
 """
 
 import argparse
+import sys
+import os
+from pathlib import Path
+
+# 添加项目根目录到 Python 路径，以支持相对导入
+project_root = Path(__file__).parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 import torch
 from torch.utils.data import DataLoader
 

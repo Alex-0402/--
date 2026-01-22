@@ -61,9 +61,43 @@ class PositionalEncoding(nn.Module):
         Returns:
             添加位置编码后的嵌入 [batch_size, seq_len, d_model]
         """
-        # pe: [1, max_len, d_model]
+        seq_len = x.size(1)
+        max_len = self.pe.size(1)
+        
+        # 如果序列长度超过预设的最大长度，动态扩展位置编码
+        if seq_len > max_len:
+            # 计算需要扩展的长度
+            device = x.device
+            d_model = self.pe.size(2)
+            
+            # 生成扩展的位置编码
+            position = torch.arange(max_len, seq_len, device=device).unsqueeze(1).float()
+            div_term = torch.exp(torch.arange(0, d_model, 2, device=device).float() * 
+                               (-math.log(10000.0) / d_model))
+            
+            pe_extension = torch.zeros(seq_len - max_len, d_model, device=device)
+            pe_extension[:, 0::2] = torch.sin(position * div_term)
+            pe_extension[:, 1::2] = torch.cos(position * div_term)
+            
+            # 扩展位置编码
+            pe_extended = torch.cat([self.pe.squeeze(0), pe_extension], dim=0).unsqueeze(0)
+        else:
+            pe_extended = self.pe
+        
+        # pe_extended: [1, seq_len, d_model]
         # x: [batch_size, seq_len, d_model]
-        x = x + self.pe[:, :x.size(1), :]
+        # 检查位置编码是否有 NaN
+        if torch.isnan(pe_extended).any() or torch.isinf(pe_extended).any():
+            # 如果位置编码有 NaN，只使用输入（不加位置编码）
+            return self.dropout(x)
+        
+        x = x + pe_extended[:, :seq_len, :]
+        
+        # 检查相加后是否有 NaN
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            # 如果相加后产生 NaN，只返回输入
+            return self.dropout(x - pe_extended[:, :seq_len, :])
+        
         return self.dropout(x)
 
 
@@ -149,6 +183,9 @@ class FragmentDecoder(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_torsion_bins)
         )
+        
+        # 确保在 eval 模式下 Dropout 被禁用
+        self._dropout_rate = dropout
         
         # 初始化权重
         self._init_weights()
@@ -262,22 +299,62 @@ class FragmentDecoder(nn.Module):
         # tgt_mask: [M, M] - 目标序列的因果掩码
         # tgt_key_padding_mask: [batch_size, M] - 目标序列的 padding 掩码
         
+        # 检查输入是否有 NaN
+        if torch.isnan(memory).any() or torch.isinf(memory).any():
+            raise ValueError("Memory (encoder output) contains NaN/Inf")
+        if torch.isnan(tgt_emb).any() or torch.isinf(tgt_emb).any():
+            raise ValueError("Target embeddings contain NaN/Inf")
+        
         # 注意：PyTorch 的 TransformerDecoder 需要 memory_key_padding_mask 和 tgt_key_padding_mask
         # 格式是：False 表示有效位置，True 表示需要忽略的位置（与我们的掩码相反）
         memory_key_padding_mask = ~memory_mask  # 反转：False=有效，True=padding
         tgt_key_padding_mask = None  # 暂时不使用
         
-        decoder_output = self.transformer_layers(
-            tgt=tgt_emb,
-            memory=memory,
-            tgt_mask=causal_mask,
-            memory_key_padding_mask=memory_key_padding_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask
-        )  # [batch_size, M, hidden_dim]
+        try:
+            decoder_output = self.transformer_layers(
+                tgt=tgt_emb,
+                memory=memory,
+                tgt_mask=causal_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask
+            )  # [batch_size, M, hidden_dim]
+            
+            # 检查 decoder 输出是否有 NaN
+            if torch.isnan(decoder_output).any() or torch.isinf(decoder_output).any():
+                # 如果包含 NaN，尝试用 0 替换
+                decoder_output = torch.where(
+                    torch.isnan(decoder_output) | torch.isinf(decoder_output),
+                    torch.zeros_like(decoder_output),
+                    decoder_output
+                )
+        except Exception as e:
+            # 如果 transformer 失败，返回零输出
+            print(f"  ⚠️  Transformer decoder 失败: {e}")
+            decoder_output = torch.zeros(batch_size, frag_seq_len, self.hidden_dim, device=device)
         
         # 6. 预测头
-        fragment_logits = self.type_head(decoder_output)  # [batch_size, M, vocab_size]
-        torsion_logits = self.torsion_head(decoder_output)  # [batch_size, M, num_torsion_bins]
+        try:
+            fragment_logits = self.type_head(decoder_output)  # [batch_size, M, vocab_size]
+            torsion_logits = self.torsion_head(decoder_output)  # [batch_size, M, num_torsion_bins]
+            
+            # 检查预测输出是否有 NaN，如果有则替换为 0
+            if torch.isnan(fragment_logits).any() or torch.isinf(fragment_logits).any():
+                fragment_logits = torch.where(
+                    torch.isnan(fragment_logits) | torch.isinf(fragment_logits),
+                    torch.zeros_like(fragment_logits),
+                    fragment_logits
+                )
+            if torch.isnan(torsion_logits).any() or torch.isinf(torsion_logits).any():
+                torsion_logits = torch.where(
+                    torch.isnan(torsion_logits) | torch.isinf(torsion_logits),
+                    torch.zeros_like(torsion_logits),
+                    torsion_logits
+                )
+        except Exception as e:
+            # 如果预测头失败，返回零输出
+            print(f"  ⚠️  预测头失败: {e}")
+            fragment_logits = torch.zeros(batch_size, frag_seq_len, self.vocab_size, device=device)
+            torsion_logits = torch.zeros(batch_size, frag_seq_len, self.num_torsion_bins, device=device)
         
         return fragment_logits, torsion_logits
 

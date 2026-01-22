@@ -6,7 +6,7 @@
 
 import torch
 from typing import Optional
-from ..data.vocabulary import SpecialTokens
+from data.vocabulary import SpecialTokens
 
 
 def create_masks(
