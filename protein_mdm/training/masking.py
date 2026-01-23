@@ -31,20 +31,18 @@ def cosine_schedule(t: torch.Tensor) -> torch.Tensor:
 def create_masks(
     fragment_token_ids: torch.Tensor,
     strategy: str = "random",
-    mask_ratio: float = 0.15,
     timesteps: Optional[torch.Tensor] = None,
-    use_cosine_schedule: bool = False,
+    use_cosine_schedule: bool = True,
     **kwargs
 ) -> torch.Tensor:
     """
-    创建片段掩码
+    创建片段掩码（离散扩散模式）
     
     Args:
         fragment_token_ids: 片段 Token IDs [batch_size, M]
         strategy: 掩码策略 ("random", "block")
-        mask_ratio: 掩码比例（0.0 到 1.0），如果提供了 timesteps 且 use_cosine_schedule=True，则会被覆盖
-        timesteps: 可选时间步 [batch_size] 或标量，范围 [0, 1]（用于离散扩散）
-        use_cosine_schedule: 是否使用 Cosine Schedule（默认False，保持向后兼容）
+        timesteps: 时间步 [batch_size] 或标量，范围 [0, 1]（用于离散扩散）
+        use_cosine_schedule: 是否使用 Cosine Schedule（默认True）
         **kwargs: 其他策略参数
     
     Returns:
@@ -53,7 +51,7 @@ def create_masks(
     batch_size, num_fragments = fragment_token_ids.shape
     device = fragment_token_ids.device
     
-    # 如果提供了时间步且使用 Cosine Schedule，计算动态 mask_ratio
+    # 使用离散扩散模式：根据时间步计算动态 mask_ratio
     if timesteps is not None and use_cosine_schedule:
         if timesteps.dim() == 0:
             # 标量时间步，扩展到batch
@@ -61,11 +59,8 @@ def create_masks(
         # 计算每个样本的 mask_ratio
         dynamic_mask_ratios = cosine_schedule(timesteps)  # [batch_size]
     else:
-        # 使用固定的 mask_ratio
-        if isinstance(mask_ratio, torch.Tensor):
-            dynamic_mask_ratios = mask_ratio
-        else:
-            dynamic_mask_ratios = torch.full((batch_size,), mask_ratio, device=device)
+        # 如果没有提供时间步，使用默认值（不应该发生，但保留作为fallback）
+        raise ValueError("离散扩散模式需要提供 timesteps 参数")
     
     masks = []
     

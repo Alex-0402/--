@@ -107,15 +107,9 @@ def main():
                        help="Warmup 轮数")
     parser.add_argument("--weight_decay", type=float, default=1e-5,
                        help="权重衰减")
-    parser.add_argument("--mask_ratio", type=float, default=0.15,
-                       help="掩码比例")
     parser.add_argument("--masking_strategy", type=str, default="random",
                        choices=["random", "block"],
                        help="掩码策略")
-    parser.add_argument("--use_discrete_diffusion", action="store_true", default=True,
-                       help="使用离散扩散模型训练（默认启用）")
-    parser.add_argument("--no_discrete_diffusion", dest="use_discrete_diffusion", action="store_false",
-                       help="禁用离散扩散模型训练")
     parser.add_argument("--num_diffusion_steps", type=int, default=1000,
                        help="扩散模型的时间步数（默认1000）")
     
@@ -206,11 +200,8 @@ def main():
         if ddp_enabled:
             print(f"总批次大小: {args.batch_size * world_size} (所有GPU)")
         print(f"训练轮数: {args.epochs}")
-        if args.use_discrete_diffusion:
-            print(f"扩散模型: 启用 (时间步数: {args.num_diffusion_steps})")
-            print(f"掩码比例: 动态 (Cosine Schedule, t=0时0%, t=1时100%)")
-        else:
-            print(f"掩码比例: {args.mask_ratio} (固定)")
+        print(f"扩散模型: 启用 (时间步数: {args.num_diffusion_steps})")
+        print(f"掩码比例: 动态 (Cosine Schedule, t=0时0%, t=1时100%)")
         print(f"掩码策略: {args.masking_strategy}")
         print("="*70)
     
@@ -296,8 +287,9 @@ def main():
             batch_size=args.batch_size,
             sampler=train_sampler,
             collate_fn=collate_fn,
-            num_workers=4,
-            pin_memory=True
+            num_workers=0,  # 改为0避免DDP死锁
+            pin_memory=True,
+            persistent_workers=False
         )
         
         val_loader = None
@@ -313,8 +305,9 @@ def main():
                 batch_size=args.batch_size,
                 sampler=val_sampler,
                 collate_fn=collate_fn,
-                num_workers=4,
-                pin_memory=True
+                num_workers=0,  # 改为0避免DDP死锁
+                pin_memory=True,
+                persistent_workers=False
             )
     else:
         # 单GPU模式：使用普通DataLoader
@@ -392,11 +385,9 @@ def main():
         device=device,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
-        mask_ratio=args.mask_ratio,
         masking_strategy=args.masking_strategy,
         ddp_enabled=ddp_enabled,
         rank=rank,
-        use_discrete_diffusion=args.use_discrete_diffusion,
         num_diffusion_steps=args.num_diffusion_steps,
         warmup_epochs=args.warmup_epochs,
         total_epochs=args.epochs

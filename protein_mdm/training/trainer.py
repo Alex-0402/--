@@ -51,11 +51,9 @@ class Trainer:
         device: Optional[torch.device] = None,
         learning_rate: float = 5e-4,
         weight_decay: float = 1e-5,
-        mask_ratio: float = 0.15,
         masking_strategy: str = "random",
         ddp_enabled: bool = False,
         rank: int = 0,
-        use_discrete_diffusion: bool = True,
         num_diffusion_steps: int = 1000,
         warmup_epochs: int = 20,
         total_epochs: int = 300
@@ -71,10 +69,12 @@ class Trainer:
             device: 设备（默认：自动检测）
             learning_rate: 学习率
             weight_decay: 权重衰减
-            mask_ratio: 掩码比例
             masking_strategy: 掩码策略
             ddp_enabled: 是否启用 DDP
             rank: 当前进程的 rank（用于打印）
+            num_diffusion_steps: 扩散模型的时间步数
+            warmup_epochs: Warmup 轮数
+            total_epochs: 总训练轮数
         """
         self.encoder = encoder
         self.decoder = decoder
@@ -83,11 +83,9 @@ class Trainer:
         self.device = device if device is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
-        self.mask_ratio = mask_ratio
         self.masking_strategy = masking_strategy
         self.ddp_enabled = ddp_enabled
         self.rank = rank
-        self.use_discrete_diffusion = use_discrete_diffusion
         self.num_diffusion_steps = num_diffusion_steps
         self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
@@ -291,36 +289,26 @@ class Trainer:
             sequence_lengths = batch['sequence_lengths'].to(self.device)
             
             # 创建掩码（离散扩散模式：采样时间步）
-            current_mask_ratio = self.mask_ratio  # 用于监控
-            if self.use_discrete_diffusion:
-                # 为每个样本随机采样时间步 t ∈ [1, T]（归一化到 [0, 1]）
-                batch_size = fragment_token_ids.shape[0]
-                # 采样整数时间步 [1, T]
-                timesteps = torch.randint(
-                    1, self.num_diffusion_steps + 1,
-                    size=(batch_size,),
-                    device=self.device
-                ).float() / self.num_diffusion_steps  # 归一化到 [0, 1]
-                
-                # 计算动态mask_ratio（用于监控）
-                from training.masking import cosine_schedule
-                dynamic_mask_ratios = cosine_schedule(timesteps)
-                current_mask_ratio = dynamic_mask_ratios.mean().item()
-                
-                fragment_masks = create_masks(
-                    fragment_token_ids,
-                    strategy=self.masking_strategy,
-                    mask_ratio=self.mask_ratio,  # 作为默认值，会被覆盖
-                    timesteps=timesteps,
-                    use_cosine_schedule=True
-                )
-            else:
-                # 传统固定mask_ratio模式（向后兼容）
-                fragment_masks = create_masks(
-                    fragment_token_ids,
-                    strategy=self.masking_strategy,
-                    mask_ratio=self.mask_ratio
-                )
+            # 为每个样本随机采样时间步 t ∈ [1, T]（归一化到 [0, 1]）
+            batch_size = fragment_token_ids.shape[0]
+            # 采样整数时间步 [1, T]
+            timesteps = torch.randint(
+                1, self.num_diffusion_steps + 1,
+                size=(batch_size,),
+                device=self.device
+            ).float() / self.num_diffusion_steps  # 归一化到 [0, 1]
+            
+            # 计算动态mask_ratio（用于监控）
+            from training.masking import cosine_schedule
+            dynamic_mask_ratios = cosine_schedule(timesteps)
+            current_mask_ratio = dynamic_mask_ratios.mean().item()
+            
+            fragment_masks = create_masks(
+                fragment_token_ids,
+                strategy=self.masking_strategy,
+                timesteps=timesteps,
+                use_cosine_schedule=True
+            )
             
             # 应用掩码
             masked_fragments = apply_masks(fragment_token_ids, fragment_masks)
@@ -418,11 +406,20 @@ class Trainer:
                         print(f"  ⚠️  警告: backbone_coords 包含 NaN/Inf，跳过此批次")
                     continue
                 
-                # 创建掩码（验证时使用固定mask_ratio，不采样时间步）
+                # 创建掩码（验证时也使用离散扩散，采样时间步）
+                # 为每个样本随机采样时间步 t ∈ [1, T]（归一化到 [0, 1]）
+                batch_size = fragment_token_ids.shape[0]
+                timesteps = torch.randint(
+                    1, self.num_diffusion_steps + 1,
+                    size=(batch_size,),
+                    device=self.device
+                ).float() / self.num_diffusion_steps
+                
                 fragment_masks = create_masks(
                     fragment_token_ids,
                     strategy=self.masking_strategy,
-                    mask_ratio=self.mask_ratio
+                    timesteps=timesteps,
+                    use_cosine_schedule=True
                 )
                 
                 # 应用掩码
@@ -562,11 +559,8 @@ class Trainer:
         
         if self.rank == 0:
             print(f"开始训练，设备: {self.device}")
-            if self.use_discrete_diffusion:
-                print(f"扩散模型: 启用 (时间步数: {self.num_diffusion_steps})")
-                print(f"掩码策略: {self.masking_strategy}, 掩码比例: 动态 (Cosine Schedule)")
-            else:
-                print(f"掩码策略: {self.masking_strategy}, 掩码比例: {self.mask_ratio} (固定)")
+            print(f"扩散模型: 启用 (时间步数: {self.num_diffusion_steps})")
+            print(f"掩码策略: {self.masking_strategy}, 掩码比例: 动态 (Cosine Schedule)")
             print(f"学习率调度: LinearWarmup ({self.warmup_epochs} epochs) + CosineAnnealing")
             print(f"最大学习率: {self.max_lr:.2e}")
             if early_stopping_patience is not None:
@@ -621,15 +615,13 @@ class Trainer:
                             # 在保存前添加barrier，确保所有rank都完成了验证
                             if self.ddp_enabled:
                                 import torch.distributed as dist
-                                dist.barrier()  # 等待所有rank完成验证
+                                dist.barrier()
                             self.save_checkpoint(
                                 os.path.join(save_dir, 'best_model.pt'),
                                 epoch, val_metrics['loss']
                             )
                             print(f"✅ 保存最佳模型 (val_loss: {val_metrics['loss']:.4f})")
-                            # 保存后再次barrier，确保保存完成
-                            if self.ddp_enabled:
-                                dist.barrier()
+                            # 保存后不再需要barrier，其他rank可以继续
                     
                     # 早停检查
                     if early_stopping_patience is not None:
@@ -671,10 +663,9 @@ class Trainer:
                         os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pt'),
                         epoch, train_metrics['loss']
                     )
-                if self.ddp_enabled:
-                    dist.barrier()
+                # 保存后不再需要barrier，其他rank可以继续
             
-            # 定期可视化（只在 rank 0 保存）
+            # 定期可视化（只在 rank 0 保存，异步执行避免阻塞）
             if visualize and VISUALIZATION_AVAILABLE and save_dir and epoch % plot_every == 0:
                 # 添加barrier确保所有rank同步
                 if self.ddp_enabled:
@@ -690,17 +681,12 @@ class Trainer:
                         )
                     except Exception as e:
                         print(f"Warning: Failed to plot training curves: {e}")
-                if self.ddp_enabled:
-                    dist.barrier()
+                # 可视化后不再需要barrier，其他rank可以继续
             elif visualize and not VISUALIZATION_AVAILABLE:
-                if self.ddp_enabled:
-                    import torch.distributed as dist
-                    dist.barrier()
+                # 不需要barrier，只是打印信息
                 if self.rank == 0:
                     if epoch == 1:
                         print("   ⚠️  可视化已请求但 matplotlib 未安装，跳过绘图")
-                if self.ddp_enabled:
-                    dist.barrier()
         
         # 训练结束后生成最终可视化（只在 rank 0 保存）
         if visualize and VISUALIZATION_AVAILABLE and save_dir:

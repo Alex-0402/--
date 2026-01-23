@@ -16,7 +16,6 @@ torchrun --nproc_per_node=8 train.py \
     --warmup_epochs 20 \
     --early_stopping_patience 30 \
     --early_stopping_min_delta 0.001 \
-    --use_discrete_diffusion \
     --num_diffusion_steps 1000 \
     --masking_strategy random \
     --save_dir checkpoints \

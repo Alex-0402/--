@@ -76,11 +76,11 @@ def main():
                        help="Decoder 层数（需与训练时一致）")
     parser.add_argument("--num_heads", type=int, default=8,
                        help="注意力头数（需与训练时一致）")
-    parser.add_argument("--mask_ratio", type=float, default=0.15,
-                       help="掩码比例（用于评估）")
     parser.add_argument("--masking_strategy", type=str, default="random",
                        choices=["random", "block"],
                        help="掩码策略")
+    parser.add_argument("--num_diffusion_steps", type=int, default=1000,
+                       help="扩散模型的时间步数（默认1000）")
     parser.add_argument("--device", type=str, default=None,
                        help="设备 (cuda/cpu)")
     parser.add_argument("--use_test_split", action="store_true",
@@ -210,8 +210,8 @@ def main():
         device=device,
         learning_rate=1e-4,  # 不会使用
         weight_decay=1e-5,   # 不会使用
-        mask_ratio=args.mask_ratio,
-        masking_strategy=args.masking_strategy
+        masking_strategy=args.masking_strategy,
+        num_diffusion_steps=args.num_diffusion_steps
     )
     
     # 在测试集上评估
@@ -237,8 +237,9 @@ def main():
             f.write(f"Epoch: {epoch}\n")
             f.write(f"测试集大小: {len(test_dataset)}\n")
             f.write(f"批次大小: {args.batch_size}\n")
-            f.write(f"掩码比例: {args.mask_ratio}\n")
+            f.write(f"扩散模型时间步数: {args.num_diffusion_steps}\n")
             f.write(f"掩码策略: {args.masking_strategy}\n")
+            f.write(f"掩码比例: 动态 (Cosine Schedule)\n")
             f.write("-"*70 + "\n")
             f.write(f"总损失: {test_metrics['loss']:.4f}\n")
             f.write(f"片段损失: {test_metrics['fragment_loss']:.4f}\n")
