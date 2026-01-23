@@ -50,7 +50,34 @@ class FragmentVocab:
         "BRANCH_CH",        # >CH- (分叉点，用于支链氨基酸)
     ]
     
-    # 20种标准氨基酸的理化特征
+    # Fragment Token 的理化特征定义
+    # 特征向量包括: [疏水性(Hydropathy), 电荷(Charge), 分子量(MW), 氢键供体数(H-donors), 氢键受体数(H-acceptors)]
+    # 这些特征直接定义每个Fragment Token本身的理化属性，而不是基于氨基酸的平均值
+    FRAGMENT_FEATURES: Dict[str, List[float]] = {
+        # 疏水片段：高疏水性, 0电荷, 0氢键
+        "METHYL": [3.0, 0.0, 15.03, 0, 0],           # -CH3: 疏水, 中性, 无氢键
+        "METHYLENE": [1.5, 0.0, 14.03, 0, 0],        # -CH2-: 中等疏水, 中性, 无氢键
+        "PHENYL": [2.5, 0.0, 77.10, 0, 0],           # C6H5-: 疏水芳香, 中性, 无氢键
+        
+        # 亲水片段：亲水性, 0电荷, 有氢键能力
+        "HYDROXYL": [-1.0, 0.0, 17.01, 1, 1],        # -OH: 亲水, 中性, 1供体1受体
+        "AMIDE": [-2.5, 0.0, 44.03, 2, 2],           # -CONH2: 亲水, 中性, 2供体2受体
+        
+        # 正电片段：亲水性, +1电荷
+        "AMINE": [-2.0, 1.0, 17.03, 2, 1],           # -NH3+: 亲水, 正电, 2供体1受体
+        "GUANIDINE": [-3.0, 1.0, 59.08, 4, 1],       # -NH-C(=NH)-NH2: 亲水, 正电, 4供体1受体
+        
+        # 负电片段：亲水性, -1电荷
+        "CARBOXYL": [-2.5, -1.0, 45.02, 0, 2],      # -COO-: 亲水, 负电, 0供体2受体
+        
+        # 特殊片段
+        "THIOL": [2.0, 0.0, 33.08, 1, 0],            # -SH: 疏水, 中性, 1供体0受体
+        "IMIDAZOLE": [-2.0, 0.5, 68.08, 2, 2],       # 咪唑环: 亲水, 弱正电, 2供体2受体
+        "INDOLE": [-0.5, 0.0, 117.15, 1, 1],         # 吲哚环: 弱亲水, 中性, 1供体1受体
+        "BRANCH_CH": [2.0, 0.0, 13.02, 0, 0],        # >CH-: 疏水支链点, 中性, 无氢键
+    }
+    
+    # 20种标准氨基酸的理化特征（保留用于其他用途）
     # 特征向量包括: [疏水性(Hydropathy), 电荷(Charge), 分子量(MW), 氢键供体数(H-donors), 氢键受体数(H-acceptors)]
     # 数据来源: Kyte-Doolittle疏水性指数, 标准分子量, 氢键能力
     PHYSICOCHEMICAL_FEATURES: Dict[str, List[float]] = {
@@ -122,34 +149,42 @@ class FragmentVocab:
             # Non-polar aliphatic
             "ALA": ["METHYL"],  # CH3
             "VAL": ["BRANCH_CH", "METHYL", "METHYL"],  # CH(CH3)2
-            "LEU": ["METHYLENE", "BRANCH_CH", "METHYL", "METHYL"],  # CH2CH(CH3)2
-            "ILE": ["METHYLENE", "BRANCH_CH", "METHYL", "METHYLENE", "METHYL"],  # CH(CH3)CH2CH3
-            "MET": ["METHYLENE", "METHYLENE", "THIOL", "METHYL"],  # CH2CH2SCH3
+            "LEU": ["METHYLENE", "BRANCH_CH", "METHYL", "METHYL"],  # CH2-CH(CH3)2
+            
+            # [修正] ILE: 去掉开头的 METHYLENE，改为直接分支
+            # 结构: CA -> CH(CH3)(CH2CH3)
+            "ILE": ["BRANCH_CH", "METHYL", "METHYLENE", "METHYL"],  
+            
+            "MET": ["METHYLENE", "METHYLENE", "THIOL", "METHYL"],  # CH2-CH2-S-CH3
             
             # Aromatic
             "PHE": ["METHYLENE", "PHENYL"],  # CH2-C6H5
             "TYR": ["METHYLENE", "PHENYL", "HYDROXYL"],  # CH2-C6H4-OH
-            "TRP": ["METHYLENE", "INDOLE"],  # CH2-吲哚环
+            "TRP": ["METHYLENE", "INDOLE"],  # CH2-Indole
             
             # Polar uncharged
-            "SER": ["HYDROXYL"],  # CH2OH
+            # [修正] SER: 增加 CB (METHYLENE)
+            "SER": ["METHYLENE", "HYDROXYL"],  # CH2-OH
+            
             "THR": ["BRANCH_CH", "HYDROXYL", "METHYL"],  # CH(OH)CH3
-            "ASN": ["METHYLENE", "AMIDE"],  # CH2CONH2
-            "GLN": ["METHYLENE", "METHYLENE", "AMIDE"],  # CH2CH2CONH2
+            "ASN": ["METHYLENE", "AMIDE"],  # CH2-CONH2
+            "GLN": ["METHYLENE", "METHYLENE", "AMIDE"],  # CH2-CH2-CONH2
             
             # Positively charged
-            "LYS": ["METHYLENE", "METHYLENE", "METHYLENE", "METHYLENE", "AMINE"],  # (CH2)4NH3+
-            "ARG": ["METHYLENE", "METHYLENE", "METHYLENE", "GUANIDINE"],  # (CH2)3-NH-C(=NH)-NH2
-            "HIS": ["METHYLENE", "IMIDAZOLE"],  # CH2-咪唑环
+            "LYS": ["METHYLENE", "METHYLENE", "METHYLENE", "METHYLENE", "AMINE"],  # (CH2)4-NH3+
+            "ARG": ["METHYLENE", "METHYLENE", "METHYLENE", "GUANIDINE"],  # (CH2)3-Guanidine
+            "HIS": ["METHYLENE", "IMIDAZOLE"],  # CH2-Imidazole
             
             # Negatively charged
-            "ASP": ["METHYLENE", "CARBOXYL"],  # CH2COO-
-            "GLU": ["METHYLENE", "METHYLENE", "CARBOXYL"],  # CH2CH2COO-
+            "ASP": ["METHYLENE", "CARBOXYL"],  # CH2-COO-
+            "GLU": ["METHYLENE", "METHYLENE", "CARBOXYL"],  # CH2-CH2-COO-
             
             # Special cases
-            "CYS": ["THIOL"],  # CH2SH
-            "GLY": [],  # 无侧链 (仅H原子)
-            "PRO": ["METHYLENE", "METHYLENE", "METHYLENE"],  # 形成环状结构，简化处理为链状
+            # [修正] CYS: 增加 CB (METHYLENE)
+            "CYS": ["METHYLENE", "THIOL"],  # CH2-SH
+            
+            "GLY": [],  # No side chain
+            "PRO": ["METHYLENE", "METHYLENE", "METHYLENE"],  # Cyclic simplified
         }
     
     def residue_to_fragments(self, res_name: str) -> List[str]:
@@ -220,10 +255,8 @@ class FragmentVocab:
         """
         将Token ID映射为理化特征向量
         
-        注意：此方法处理的是片段Token ID，而不是残基名称。
-        由于片段Token可能来自不同的残基，我们需要一个映射策略：
-        - 对于特殊Token（PAD, MASK等），返回零向量
-        - 对于片段Token，返回该片段所属残基的平均理化特征
+        此方法直接使用 FRAGMENT_FEATURES 字典查询每个Fragment Token本身的理化属性，
+        而不是基于氨基酸的平均值计算。这提供了更准确和科学的特征表示。
         
         Args:
             token_ids: Token ID张量 [batch_size, seq_len] 或 [seq_len]
@@ -243,105 +276,35 @@ class FragmentVocab:
         batch_size, seq_len = token_ids.shape
         device = token_ids.device
         
-        # 片段Token到特征的映射（使用固定索引）
+        # 构建Token ID到Fragment名称的映射
         # 索引: PAD=0, MASK=1, BOS=2, EOS=3, 然后片段从4开始
-        # 片段顺序: METHYL(4), METHYLENE(5), HYDROXYL(6), PHENYL(7), AMINE(8), 
-        #          CARBOXYL(9), AMIDE(10), GUANIDINE(11), IMIDAZOLE(12), INDOLE(13), 
-        #          THIOL(14), BRANCH_CH(15)
-        fragment_to_features = {
-            # 特殊Token -> 零向量
-            SpecialTokens.PAD: [0.0, 0.0, 0.0, 0.0, 0.0],
-            SpecialTokens.MASK: [0.0, 0.0, 0.0, 0.0, 0.0],
-            SpecialTokens.BOS: [0.0, 0.0, 0.0, 0.0, 0.0],
-            SpecialTokens.EOS: [0.0, 0.0, 0.0, 0.0, 0.0],
-            
-            # 片段Token -> 基于常见残基的平均特征
-            # METHYL (4): 主要来自疏水残基 (ALA, VAL, LEU, ILE)
-            4: [
-                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["ALA"][0], 
-                              self.PHYSICOCHEMICAL_FEATURES["VAL"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["LEU"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["ILE"][0]])),
-                0.0,
-                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["ALA"][2], 
-                              self.PHYSICOCHEMICAL_FEATURES["VAL"][2],
-                              self.PHYSICOCHEMICAL_FEATURES["LEU"][2],
-                              self.PHYSICOCHEMICAL_FEATURES["ILE"][2]])),
-                0.0, 0.0
-            ],
-            # METHYLENE (5): 中性特征
-            5: [0.0, 0.0, 14.0, 0.0, 0.0],
-            # HYDROXYL (6): 亲水特征 (SER, THR, TYR)
-            6: [
-                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["SER"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["THR"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["TYR"][0]])),
-                0.0, 17.0, 1.0, 1.0
-            ],
-            # PHENYL (7): 芳香特征 (PHE, TYR)
-            7: [
-                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["PHE"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["TYR"][0]])),
-                0.0, 77.0, 0.0, 0.0
-            ],
-            # AMINE (8): 正电特征 (LYS)
-            8: [
-                float(self.PHYSICOCHEMICAL_FEATURES["LYS"][0]),
-                1.0, 17.0, 2.0, 1.0
-            ],
-            # CARBOXYL (9): 负电特征 (ASP, GLU)
-            9: [
-                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["ASP"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["GLU"][0]])),
-                -1.0, 45.0, 0.0, 2.0
-            ],
-            # AMIDE (10): 亲水特征 (ASN, GLN)
-            10: [
-                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["ASN"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["GLN"][0]])),
-                0.0, 44.0, 2.0, 2.0
-            ],
-            # GUANIDINE (11): 正电特征 (ARG)
-            11: [
-                float(self.PHYSICOCHEMICAL_FEATURES["ARG"][0]),
-                1.0, 59.0, 4.0, 1.0
-            ],
-            # IMIDAZOLE (12): 弱正电特征 (HIS)
-            12: [
-                float(self.PHYSICOCHEMICAL_FEATURES["HIS"][0]),
-                0.5, 68.0, 2.0, 2.0
-            ],
-            # INDOLE (13): 芳香特征 (TRP)
-            13: [
-                float(self.PHYSICOCHEMICAL_FEATURES["TRP"][0]),
-                0.0, 117.0, 1.0, 1.0
-            ],
-            # THIOL (14): 疏水特征 (CYS, MET)
-            14: [
-                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["CYS"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["MET"][0]])),
-                0.0, 33.0, 1.0, 0.0
-            ],
-            # BRANCH_CH (15): 支链特征 (VAL, LEU, ILE, THR)
-            15: [
-                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["VAL"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["LEU"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["ILE"][0],
-                              self.PHYSICOCHEMICAL_FEATURES["THR"][0]])),
-                0.0, 13.0, 0.0, 0.0
-            ],
-        }
+        # 片段顺序与 FRAGMENT_TOKENS 列表一致
+        idx_to_fragment = {}
+        for idx, fragment in enumerate(self.FRAGMENT_TOKENS, start=4):
+            idx_to_fragment[idx] = fragment
         
         # 使用向量化操作构建特征矩阵（更高效）
         token_ids_flat = token_ids.flatten().cpu().numpy()
         features_list = []
         for token_id in token_ids_flat:
             token_id_int = int(token_id)
-            if token_id_int in fragment_to_features:
-                feat = fragment_to_features[token_id_int]
+            
+            # 特殊Token -> 零向量
+            if token_id_int in [SpecialTokens.PAD, SpecialTokens.MASK, 
+                               SpecialTokens.BOS, SpecialTokens.EOS]:
+                feat = [0.0, 0.0, 0.0, 0.0, 0.0]
+            # 片段Token -> 直接从 FRAGMENT_FEATURES 字典查询
+            elif token_id_int in idx_to_fragment:
+                fragment_name = idx_to_fragment[token_id_int]
+                if fragment_name in self.FRAGMENT_FEATURES:
+                    feat = self.FRAGMENT_FEATURES[fragment_name].copy()
+                else:
+                    # 未知片段，使用零向量
+                    feat = [0.0, 0.0, 0.0, 0.0, 0.0]
             else:
                 # 未知Token，使用零向量
                 feat = [0.0, 0.0, 0.0, 0.0, 0.0]
+            
             features_list.append(feat)
         
         # 转换为张量

@@ -28,20 +28,25 @@ echo ""
 
 cd /home/Oliver-0402/--/protein_mdm
 
-# 找到最新的checkpoint
-LATEST_CHECKPOINT=$(ls -t checkpoints/checkpoint_epoch_*.pt 2>/dev/null | head -1)
-if [ -z "$LATEST_CHECKPOINT" ]; then
-    LATEST_CHECKPOINT="checkpoints/checkpoint_epoch_220.pt"
+# 使用最佳模型继续训练
+RESUME_MODEL="checkpoints/best_model.pt"
+if [ ! -f "$RESUME_MODEL" ]; then
+    echo "⚠️  警告: best_model.pt 不存在，尝试使用最新的 checkpoint"
+    RESUME_MODEL=$(ls -t checkpoints/checkpoint_epoch_*.pt 2>/dev/null | head -1)
+    if [ -z "$RESUME_MODEL" ]; then
+        echo "❌ 错误: 找不到任何模型文件"
+        exit 1
+    fi
 fi
 
-echo "使用checkpoint: $LATEST_CHECKPOINT"
+echo "使用模型: $RESUME_MODEL"
 
 torchrun --nproc_per_node=8 train.py \
     --pdb_path data/cache \
     --cache_dir data/cache \
     --use_predefined_split \
-    --resume "$LATEST_CHECKPOINT" \
-    --epochs 300 \
+    --resume "$RESUME_MODEL" \
+    --epochs 600 \
     --batch_size 4 \
     --learning_rate 2e-4 \
     --weight_decay 1e-4 \

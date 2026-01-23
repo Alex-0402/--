@@ -368,8 +368,9 @@ def main():
         else:
             device_id = 0  # 默认值
         
-        # 使用 find_unused_parameters=True 因为 encoder 中的 physicochemical_proj 可能在某些情况下不被使用
-        encoder = DDP(encoder, device_ids=[device_id], output_device=device_id, find_unused_parameters=True)
+        # 根据警告，实际上没有未使用的参数，所以设置为False以提高性能
+        # 如果将来确实有未使用的参数，可以改回True
+        encoder = DDP(encoder, device_ids=[device_id], output_device=device_id, find_unused_parameters=False)
         decoder = DDP(decoder, device_ids=[device_id], output_device=device_id)
         if rank == 0:
             print(f"   模型已包装为 DDP (device_id={device_id})")

@@ -271,6 +271,13 @@ class Trainer:
         Returns:
             训练指标字典
         """
+        # DDP 模式下，确保所有进程在开始训练前同步
+        if self.ddp_enabled:
+            import torch.distributed as dist
+            print(f"[Rank {self.rank}] train_epoch 开始，准备进入初始 barrier...", flush=True)
+            dist.barrier()
+            print(f"[Rank {self.rank}] train_epoch 初始 barrier 通过", flush=True)
+        
         self.encoder.train()
         self.decoder.train()
         
@@ -280,92 +287,250 @@ class Trainer:
         total_structure_loss = 0.0
         num_batches = 0
         
-        pbar = tqdm(self.train_loader, desc="Training")
-        for batch in pbar:
-            # 移动到设备
-            backbone_coords = batch['backbone_coords'].to(self.device)
-            fragment_token_ids = batch['fragment_token_ids'].to(self.device)
-            torsion_bins = batch['torsion_bins'].to(self.device)
-            sequence_lengths = batch['sequence_lengths'].to(self.device)
-            
-            # 创建掩码（离散扩散模式：采样时间步）
-            # 为每个样本随机采样时间步 t ∈ [1, T]（归一化到 [0, 1]）
-            batch_size = fragment_token_ids.shape[0]
-            # 采样整数时间步 [1, T]
-            timesteps = torch.randint(
-                1, self.num_diffusion_steps + 1,
-                size=(batch_size,),
-                device=self.device
-            ).float() / self.num_diffusion_steps  # 归一化到 [0, 1]
-            
-            # 计算动态mask_ratio（用于监控）
-            from training.masking import cosine_schedule
-            dynamic_mask_ratios = cosine_schedule(timesteps)
-            current_mask_ratio = dynamic_mask_ratios.mean().item()
-            
-            fragment_masks = create_masks(
-                fragment_token_ids,
-                strategy=self.masking_strategy,
-                timesteps=timesteps,
-                use_cosine_schedule=True
-            )
-            
-            # 应用掩码
-            masked_fragments = apply_masks(fragment_token_ids, fragment_masks)
-            
-            # 前向传播
-            self.optimizer.zero_grad()
-            
-            # Encoder（传递残基类型以支持理化特征）
-            residue_types = batch.get('residue_types', None)
-            node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=residue_types)
-            
-            # Decoder
-            frag_logits, tors_logits = self.decoder(
-                node_embeddings=node_embeddings,
-                target_fragments=masked_fragments,
-                sequence_lengths=sequence_lengths
-            )
-            
-            # 计算损失
-            losses = self.compute_loss(
-                frag_logits, tors_logits,
-                fragment_token_ids, torsion_bins,
-                fragment_mask=fragment_masks
-            )
-            
-            # 检查损失是否为 NaN 或 Inf
-            if torch.isnan(losses['total_loss']) or torch.isinf(losses['total_loss']):
+        # 在创建迭代器前再次同步（关键：确保所有进程都准备好）
+        if self.ddp_enabled:
+            import torch.distributed as dist
+            print(f"[Rank {self.rank}] 准备进入创建迭代器前的 barrier...", flush=True)
+            dist.barrier()
+            print(f"[Rank {self.rank}] 创建迭代器前的 barrier 通过", flush=True)
+            if self.rank == 0:
+                print(f"[Rank 0] 开始创建数据加载器迭代器...", flush=True)
+        
+        # 关键修复：每次 epoch 都重新创建迭代器
+        # 注意：DataLoader 的迭代器在每次 epoch 都需要重新创建
+        # 所有进程都先创建迭代器
+        try:
+            print(f"[Rank {self.rank}] 正在创建迭代器...", flush=True)
+            data_iter = iter(self.train_loader)
+            print(f"[Rank {self.rank}] 迭代器创建成功", flush=True)
+        except Exception as e:
+            print(f"[Rank {self.rank}] ❌ 迭代器创建失败: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+        
+        # 同步：确保所有进程都创建了迭代器
+        if self.ddp_enabled:
+            import torch.distributed as dist
+            print(f"[Rank {self.rank}] 等待所有进程创建迭代器（barrier）...", flush=True)
+            if self.rank == 0:
+                print(f"[Rank 0] 等待所有进程创建迭代器...", flush=True)
+            dist.barrier()
+            print(f"[Rank {self.rank}] 迭代器创建完成，所有进程已同步", flush=True)
+            if self.rank == 0:
+                print(f"[Rank 0] 迭代器创建完成，所有进程已同步", flush=True)
+        
+        # 现在创建 tqdm（只在 rank 0，不阻塞其他进程）
+        # 注意：tqdm 创建不应该阻塞其他进程
+        print(f"[Rank {self.rank}] 准备创建 tqdm（如果需要）...", flush=True)
+        if self.rank == 0:
+            total_batches = len(self.train_loader)
+            pbar = tqdm(total=total_batches, desc="Training", initial=0)
+            print(f"[Rank 0] tqdm 进度条创建完成", flush=True)
+        else:
+            pbar = None
+            print(f"[Rank {self.rank}] 跳过 tqdm（非 rank 0）", flush=True)
+        
+        # 在开始迭代前，最后一次同步（确保所有进程都准备好）
+        # 这是关键：确保所有进程都创建了迭代器和 tqdm（如果需要）
+        # 注意：这个 barrier 可能会卡住，如果某些进程没有到达这里
+        if self.ddp_enabled:
+            import torch.distributed as dist
+            # 确保所有打印都完成（flush）
+            import sys
+            sys.stdout.flush()
+            # 每个进程都打印自己的状态（用于调试）
+            print(f"[Rank {self.rank}] 准备进入开始迭代前的 barrier...", flush=True)
+            if self.rank == 0:
+                print(f"[Rank 0] 等待所有进程准备就绪（开始迭代前）...", flush=True)
+            # 关键：确保所有进程都到达这里才继续
+            # 使用 barrier 同步所有进程
+            try:
+                # 在 barrier 前，确保所有输出都刷新
+                sys.stdout.flush()
+                dist.barrier()
+                # barrier 通过后，所有进程都应该在这里
+                print(f"[Rank {self.rank}] 开始迭代前的 barrier 通过", flush=True)
                 if self.rank == 0:
-                    print(f"  ⚠️  警告: 训练批次 {num_batches} 的损失为 NaN/Inf，跳过")
-                self.optimizer.zero_grad()  # 清除梯度
-                continue
-            
-            # 反向传播
-            losses['total_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self.encoder.parameters()) + list(self.decoder.parameters()),
-                max_norm=1.0
-            )
-            self.optimizer.step()
-            
-            # 更新指标
-            total_loss += losses['total_loss'].item()
-            total_fragment_loss += losses['fragment_loss'].item()
-            total_torsion_loss += losses['torsion_loss'].item()
-            total_structure_loss += losses.get('structure_loss', torch.tensor(0.0)).item()
-            num_batches += 1
-            
-            # 更新进度条
-            current_lr = self.optimizer.param_groups[0]['lr']
-            pbar.set_postfix({
-                'loss': f"{losses['total_loss'].item():.4f}",
-                'frag': f"{losses['fragment_loss'].item():.4f}",
-                'tors': f"{losses['torsion_loss'].item():.4f}",
-                'struct': f"{losses.get('structure_loss', torch.tensor(0.0)).item():.4f}",
-                'mask_ratio': f"{current_mask_ratio:.3f}",
-                'lr': f"{current_lr:.2e}"
-            })
+                    print(f"[Rank 0] 所有进程准备就绪，开始训练迭代...", flush=True)
+            except Exception as e:
+                print(f"[Rank {self.rank}] ⚠️  barrier 失败: {e}", flush=True)
+                raise
+        
+        # 现在开始迭代
+        batch_idx = 0
+        total_batches_expected = len(self.train_loader)
+        # 所有进程都打印，但使用 flush 确保输出及时
+        # 注意：这个打印应该在 barrier 之后，所以如果看到这个打印，说明已经通过了 barrier
+        print(f"[Rank {self.rank}] 预期处理 {total_batches_expected} 个批次（barrier 已通过）", flush=True)
+        
+        try:
+            print(f"[Rank {self.rank}] 准备开始迭代数据...", flush=True)
+            for batch in data_iter:
+                # 移动到设备
+                backbone_coords = batch['backbone_coords'].to(self.device)
+                fragment_token_ids = batch['fragment_token_ids'].to(self.device)
+                torsion_bins = batch['torsion_bins'].to(self.device)
+                sequence_lengths = batch['sequence_lengths'].to(self.device)
+                
+                # 创建掩码（离散扩散模式：采样时间步）
+                # 为每个样本随机采样时间步 t ∈ [1, T]（归一化到 [0, 1]）
+                batch_size = fragment_token_ids.shape[0]
+                # 采样整数时间步 [1, T]
+                timesteps = torch.randint(
+                    1, self.num_diffusion_steps + 1,
+                    size=(batch_size,),
+                    device=self.device
+                ).float() / self.num_diffusion_steps  # 归一化到 [0, 1]
+                
+                # 计算动态mask_ratio（用于监控）
+                from training.masking import cosine_schedule
+                dynamic_mask_ratios = cosine_schedule(timesteps)
+                current_mask_ratio = dynamic_mask_ratios.mean().item()
+                
+                fragment_masks = create_masks(
+                    fragment_token_ids,
+                    strategy=self.masking_strategy,
+                    timesteps=timesteps,
+                    use_cosine_schedule=True
+                )
+                
+                # 应用掩码
+                masked_fragments = apply_masks(fragment_token_ids, fragment_masks)
+                
+                # 前向传播
+                self.optimizer.zero_grad()
+                
+                # Encoder（传递残基类型以支持理化特征）
+                residue_types = batch.get('residue_types', None)
+                node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=residue_types)
+                
+                # Decoder
+                frag_logits, tors_logits = self.decoder(
+                    node_embeddings=node_embeddings,
+                    target_fragments=masked_fragments,
+                    sequence_lengths=sequence_lengths
+                )
+                
+                # 计算损失
+                losses = self.compute_loss(
+                    frag_logits, tors_logits,
+                    fragment_token_ids, torsion_bins,
+                    fragment_mask=fragment_masks
+                )
+                
+                # 检查损失是否为 NaN 或 Inf
+                if torch.isnan(losses['total_loss']) or torch.isinf(losses['total_loss']):
+                    if self.rank == 0:
+                        print(f"  ⚠️  警告: 训练批次 {num_batches} 的损失为 NaN/Inf，跳过")
+                    self.optimizer.zero_grad()  # 清除梯度
+                    continue
+                
+                # 反向传播
+                losses['total_loss'].backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.encoder.parameters()) + list(self.decoder.parameters()),
+                    max_norm=1.0
+                )
+                self.optimizer.step()
+                
+                # 更新指标
+                total_loss += losses['total_loss'].item()
+                total_fragment_loss += losses['fragment_loss'].item()
+                total_torsion_loss += losses['torsion_loss'].item()
+                total_structure_loss += losses.get('structure_loss', torch.tensor(0.0)).item()
+                num_batches += 1
+                
+                # 更新进度条（只在 rank 0）
+                batch_idx += 1
+                if pbar is not None:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'loss': f"{losses['total_loss'].item():.4f}",
+                        'frag': f"{losses['fragment_loss'].item():.4f}",
+                        'tors': f"{losses['torsion_loss'].item():.4f}",
+                        'struct': f"{losses.get('structure_loss', torch.tensor(0.0)).item():.4f}",
+                        'mask_ratio': f"{current_mask_ratio:.3f}",
+                        'lr': f"{current_lr:.2e}"
+                    })
+                
+                # 在最后一个批次时添加调试信息
+                if batch_idx == len(self.train_loader) and self.rank == 0:
+                    print(f"[Rank 0] 处理最后一个批次 ({batch_idx}/{len(self.train_loader)})...")
+                
+                # 注意：不要在循环内部添加 barrier，因为不同进程的批次数量可能不同
+                # DistributedSampler 可能导致某些进程的批次数量略有不同
+        except Exception as e:
+            # 捕获迭代过程中的异常
+            if self.rank == 0:
+                print(f"[Rank 0] ⚠️  错误: 训练迭代过程中出现异常: {e}")
+                import traceback
+                traceback.print_exc()
+            # 即使出错也尝试同步
+            if self.ddp_enabled:
+                import torch.distributed as dist
+                try:
+                    dist.barrier()
+                except:
+                    pass
+            raise  # 重新抛出异常
+        
+        # 在关闭进度条前添加调试信息
+        print(f"[Rank {self.rank}] 训练循环结束，batch_idx={batch_idx}, 预期={total_batches_expected}")
+        
+        # 关闭进度条（可能导致卡住，添加超时保护）
+        if pbar is not None:
+            try:
+                if self.rank == 0:
+                    print(f"[Rank 0] 准备关闭进度条...")
+                pbar.close()
+                if self.rank == 0:
+                    print(f"[Rank 0] 进度条已关闭")
+            except Exception as e:
+                print(f"[Rank {self.rank}] ⚠️  警告: 关闭进度条时出错: {e}")
+        
+        print(f"[Rank {self.rank}] 训练迭代完成，处理了 {batch_idx} 个批次（预期 {total_batches_expected} 个）")
+        if self.rank == 0:
+            print(f"[Rank 0] 准备同步所有进程...")
+        
+        # DDP 模式下，确保所有进程完成训练后同步
+        # 这是关键：所有进程必须都完成迭代才能继续
+        # 注意：不同进程可能处理不同数量的批次（DistributedSampler 的特性）
+        # 所以 barrier 应该在所有进程都退出循环后执行
+        if self.ddp_enabled:
+            import torch.distributed as dist
+            # 每个进程都打印自己的状态（用于调试）
+            print(f"[Rank {self.rank}] 训练循环完成，处理了 {batch_idx} 个批次，准备进入 barrier...")
+            if self.rank == 0:
+                print(f"[Rank 0] 等待所有进程完成训练（barrier）...")
+                print(f"[Rank 0] 注意：不同进程可能处理不同数量的批次，这是正常的")
+            try:
+                # 注意：dist.barrier() 不支持 timeout 参数
+                # NCCL 后端有默认超时（约30分钟），如果超时会自动失败
+                dist.barrier()
+                if self.rank == 0:
+                    print(f"[Rank 0] ✅ 所有进程完成训练，同步成功")
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"[Rank 0] ⚠️  警告: barrier 失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                # 即使失败也继续，避免死锁
+        
+        # 在 barrier 后收集批次数量（用于调试，但不阻塞）
+        if self.ddp_enabled:
+            import torch.distributed as dist
+            try:
+                batch_tensor = torch.tensor([batch_idx], dtype=torch.long, device=self.device)
+                gathered = [torch.zeros_like(batch_tensor) for _ in range(dist.get_world_size())]
+                dist.all_gather(gathered, batch_tensor)
+                batch_counts = [t.item() for t in gathered]
+                if self.rank == 0:
+                    print(f"[Rank 0] 各进程处理的批次数量: {batch_counts}")
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"[Rank 0] ⚠️  警告: 收集批次数量失败: {e}")
         
         return {
             'loss': total_loss / num_batches,
@@ -384,6 +549,11 @@ class Trainer:
         if self.val_loader is None:
             return {}
         
+        # DDP 模式下，确保所有进程在开始验证前同步
+        if self.ddp_enabled:
+            import torch.distributed as dist
+            dist.barrier()
+        
         self.encoder.eval()
         self.decoder.eval()
         
@@ -394,7 +564,8 @@ class Trainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validation"):
+            # 只在 rank 0 显示进度条，其他 rank 禁用
+            for batch in tqdm(self.val_loader, desc="Validation", disable=(self.rank != 0)):
                 backbone_coords = batch['backbone_coords'].to(self.device)
                 fragment_token_ids = batch['fragment_token_ids'].to(self.device)
                 torsion_bins = batch['torsion_bins'].to(self.device)
@@ -489,6 +660,11 @@ class Trainer:
                 total_structure_loss += losses.get('structure_loss', torch.tensor(0.0)).item()
                 num_batches += 1
         
+        # DDP 模式下，确保所有进程完成验证后同步
+        if self.ddp_enabled:
+            import torch.distributed as dist
+            dist.barrier()
+        
         # 如果没有批次，返回空字典
         if num_batches == 0:
             return {}
@@ -570,17 +746,56 @@ class Trainer:
         
         for epoch in range(start_epoch, num_epochs + 1):
             self.current_epoch = epoch
+            
+            # DDP 模式下，确保所有进程在 epoch 开始前同步
+            if self.ddp_enabled:
+                import torch.distributed as dist
+                dist.barrier()
+            
             # DDP 模式下，每个 epoch 需要设置 sampler 的 epoch
+            # 注意：set_epoch 必须在所有进程上调用，且必须在创建迭代器之前
             if train_sampler is not None:
+                if self.rank == 0:
+                    print(f"[Rank 0] 设置 sampler epoch 为 {epoch}...")
                 train_sampler.set_epoch(epoch)
+                if self.rank == 0:
+                    print(f"[Rank 0] sampler epoch 设置完成")
+            
+            # 同步：确保所有进程都设置了 sampler
+            if self.ddp_enabled:
+                import torch.distributed as dist
+                if self.rank == 0:
+                    print(f"[Rank 0] 等待所有进程设置 sampler...")
+                dist.barrier()
+                if self.rank == 0:
+                    print(f"[Rank 0] 所有进程已设置 sampler")
             
             if self.rank == 0:
                 print(f"\nEpoch {epoch}/{num_epochs}")
                 print("-" * 60)
+                print(f"[Rank 0] 准备开始训练 epoch {epoch}...")
+            
+            # 在所有进程开始训练前，最后一次同步
+            if self.ddp_enabled:
+                import torch.distributed as dist
+                if self.rank == 0:
+                    print(f"[Rank 0] 等待所有进程准备开始训练 epoch {epoch}...")
+                dist.barrier()
+                if self.rank == 0:
+                    print(f"[Rank 0] 所有进程已同步，开始训练...")
             
             # 训练
             train_metrics = self.train_epoch()
             self.train_losses.append(train_metrics)
+            
+            # 确保所有进程都完成了训练（在打印结果前）
+            if self.ddp_enabled:
+                import torch.distributed as dist
+                if self.rank == 0:
+                    print(f"[Rank 0] 等待所有进程完成训练 epoch {epoch}...")
+                dist.barrier()
+                if self.rank == 0:
+                    print(f"[Rank 0] 所有进程完成训练 epoch {epoch}")
             
             if self.rank == 0:
                 print(f"Train Loss: {train_metrics['loss']:.4f} "

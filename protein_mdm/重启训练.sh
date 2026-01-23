@@ -42,8 +42,8 @@ torchrun --nproc_per_node=8 train.py \
     --pdb_path data/cache \
     --cache_dir data/cache \
     --use_predefined_split \
-    --resume checkpoints/checkpoint_epoch_220.pt \
-    --epochs 300 \
+    --resume checkpoints/best_model.pt \
+    --epochs 600 \
     --batch_size 4 \
     --learning_rate 2e-4 \
     --weight_decay 1e-4 \
