@@ -99,10 +99,12 @@ def main():
                        help="注意力头数")
     
     # 训练参数
-    parser.add_argument("--epochs", type=int, default=50,
+    parser.add_argument("--epochs", type=int, default=300,
                        help="训练轮数")
-    parser.add_argument("--learning_rate", type=float, default=1e-4,
-                       help="学习率")
+    parser.add_argument("--learning_rate", type=float, default=5e-4,
+                       help="学习率（最大学习率）")
+    parser.add_argument("--warmup_epochs", type=int, default=20,
+                       help="Warmup 轮数")
     parser.add_argument("--weight_decay", type=float, default=1e-5,
                        help="权重衰减")
     parser.add_argument("--mask_ratio", type=float, default=0.15,
@@ -110,12 +112,24 @@ def main():
     parser.add_argument("--masking_strategy", type=str, default="random",
                        choices=["random", "block"],
                        help="掩码策略")
+    parser.add_argument("--use_discrete_diffusion", action="store_true", default=True,
+                       help="使用离散扩散模型训练（默认启用）")
+    parser.add_argument("--no_discrete_diffusion", dest="use_discrete_diffusion", action="store_false",
+                       help="禁用离散扩散模型训练")
+    parser.add_argument("--num_diffusion_steps", type=int, default=1000,
+                       help="扩散模型的时间步数（默认1000）")
     
     # 其他参数
     parser.add_argument("--save_dir", type=str, default="checkpoints",
                        help="保存目录")
     parser.add_argument("--device", type=str, default=None,
                        help="设备 (cuda/cpu)")
+    parser.add_argument("--visualize", action="store_true", default=True,
+                       help="启用训练可视化（默认启用）")
+    parser.add_argument("--no_visualize", dest="visualize", action="store_false",
+                       help="禁用训练可视化")
+    parser.add_argument("--plot_every", type=int, default=5,
+                       help="每 N 个 epoch 绘制一次图表（默认 5）")
     
     # DDP 参数
     parser.add_argument("--ddp", action="store_true",
@@ -179,7 +193,11 @@ def main():
         if ddp_enabled:
             print(f"总批次大小: {args.batch_size * world_size} (所有GPU)")
         print(f"训练轮数: {args.epochs}")
-        print(f"掩码比例: {args.mask_ratio}")
+        if args.use_discrete_diffusion:
+            print(f"扩散模型: 启用 (时间步数: {args.num_diffusion_steps})")
+            print(f"掩码比例: 动态 (Cosine Schedule, t=0时0%, t=1时100%)")
+        else:
+            print(f"掩码比例: {args.mask_ratio} (固定)")
         print(f"掩码策略: {args.masking_strategy}")
         print("="*70)
     
@@ -344,7 +362,8 @@ def main():
         else:
             device_id = 0  # 默认值
         
-        encoder = DDP(encoder, device_ids=[device_id], output_device=device_id)
+        # 使用 find_unused_parameters=True 因为 encoder 中的 physicochemical_proj 可能在某些情况下不被使用
+        encoder = DDP(encoder, device_ids=[device_id], output_device=device_id, find_unused_parameters=True)
         decoder = DDP(decoder, device_ids=[device_id], output_device=device_id)
         if rank == 0:
             print(f"   模型已包装为 DDP (device_id={device_id})")
@@ -363,17 +382,25 @@ def main():
         mask_ratio=args.mask_ratio,
         masking_strategy=args.masking_strategy,
         ddp_enabled=ddp_enabled,
-        rank=rank
+        rank=rank,
+        use_discrete_diffusion=args.use_discrete_diffusion,
+        num_diffusion_steps=args.num_diffusion_steps,
+        warmup_epochs=args.warmup_epochs,
+        total_epochs=args.epochs
     )
     
     # 开始训练
     if rank == 0:
         print("\n4. 开始训练...")
+        if args.visualize:
+            print(f"   可视化: 启用 (每 {args.plot_every} 个 epoch 绘制一次)")
     trainer.train(
         num_epochs=args.epochs,
         save_dir=args.save_dir,
         save_every=10,
-        train_sampler=train_sampler if ddp_enabled else None
+        train_sampler=train_sampler if ddp_enabled else None,
+        visualize=args.visualize,
+        plot_every=args.plot_every
     )
     
     if rank == 0:

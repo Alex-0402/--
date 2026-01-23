@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 # 导入 torch_geometric（必需）
 try:
@@ -337,7 +337,7 @@ class BackboneEncoder(nn.Module):
     
     架构流程：
     1. 构图：基于 C-alpha 原子构建 k-NN 图
-    2. 特征提取：计算节点特征（二面角）和边特征（距离、方向）
+    2. 特征提取：计算节点特征（二面角 + 理化特征）和边特征（距离、方向）
     3. GNN 层：多层消息传递更新节点特征
     4. 输出：节点嵌入 [batch_size, L, hidden_dim]
     """
@@ -349,7 +349,9 @@ class BackboneEncoder(nn.Module):
         k_neighbors: int = 30,
         node_feat_dim: int = 64,
         edge_feat_dim: int = 32,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_physicochemical: bool = True,
+        physicochemical_dim: int = 5
     ):
         """
         Args:
@@ -359,11 +361,15 @@ class BackboneEncoder(nn.Module):
             node_feat_dim: 节点特征维度（二面角编码后的维度）
             edge_feat_dim: 边特征维度（RBF 编码后的维度）
             dropout: Dropout 率
+            use_physicochemical: 是否使用理化特征（默认True）
+            physicochemical_dim: 理化特征维度（默认5：疏水性、电荷、分子量、氢键供体、氢键受体）
         """
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.k_neighbors = k_neighbors
+        self.use_physicochemical = use_physicochemical
+        self.physicochemical_dim = physicochemical_dim
         
         # 二面角编码器
         self.dihedral_encoder = DihedralAngleEncoder(output_dim=node_feat_dim)
@@ -371,8 +377,14 @@ class BackboneEncoder(nn.Module):
         # RBF 编码器（用于距离编码）
         self.rbf_encoder = RBFEncoder(num_rbf=edge_feat_dim, cutoff=20.0)
         
+        # 理化特征投影层（将理化特征映射到隐藏维度）
+        if use_physicochemical:
+            self.physicochemical_proj = nn.Linear(physicochemical_dim, hidden_dim)
+        
         # 节点特征投影（从二面角特征到隐藏维度）
-        self.node_proj = nn.Linear(node_feat_dim, hidden_dim)
+        # 如果使用理化特征，需要融合，所以投影维度可能需要调整
+        geometric_dim = node_feat_dim
+        self.node_proj = nn.Linear(geometric_dim, hidden_dim)
         
         # GNN 层堆叠
         self.gnn_layers = nn.ModuleList()
@@ -487,7 +499,8 @@ class BackboneEncoder(nn.Module):
     def forward(
         self,
         backbone_coords: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
+        mask: Optional[torch.Tensor] = None,
+        residue_types: Optional[List[List[str]]] = None
     ) -> torch.Tensor:
         """
         编码骨架坐标为节点嵌入
@@ -496,6 +509,7 @@ class BackboneEncoder(nn.Module):
             backbone_coords: 骨架坐标 [batch_size, L, 4, 3]
                            4 个原子：N, CA, C, O
             mask: 可选掩码 [batch_size, L]，True 表示有效位置
+            residue_types: 可选残基类型列表 [batch_size, L]，每个元素是3字母残基代码（如'ALA'）
         
         Returns:
             节点嵌入 [batch_size, L, hidden_dim]
@@ -506,9 +520,57 @@ class BackboneEncoder(nn.Module):
         # 提取 C-alpha 坐标（索引 1）
         ca_coords = backbone_coords[:, :, 1, :]  # [batch_size, L, 3]
         
-        # 1. 计算节点特征（二面角编码）
-        node_features = self.dihedral_encoder(backbone_coords)  # [batch_size, L, node_feat_dim]
-        node_features = self.node_proj(node_features)  # [batch_size, L, hidden_dim]
+        # 1. 计算几何特征（二面角编码）
+        geometric_features = self.dihedral_encoder(backbone_coords)  # [batch_size, L, node_feat_dim]
+        geometric_features = self.node_proj(geometric_features)  # [batch_size, L, hidden_dim]
+        
+        # 2. 计算理化特征（如果启用）
+        if self.use_physicochemical:
+            # 从vocabulary模块导入理化特征
+            from data.vocabulary import get_vocab
+            vocab = get_vocab()
+            
+            if residue_types is not None:
+                # 根据残基类型获取理化特征
+                physicochemical_features = []
+                for b in range(batch_size):
+                    batch_features = []
+                    for l in range(seq_len):
+                        if l < len(residue_types[b]):
+                            res_name = residue_types[b][l]
+                            if res_name in vocab.PHYSICOCHEMICAL_FEATURES:
+                                feat = vocab.PHYSICOCHEMICAL_FEATURES[res_name]
+                            else:
+                                # 未知残基，使用零向量
+                                feat = [0.0, 0.0, 0.0, 0.0, 0.0]
+                        else:
+                            # 超出序列长度，使用零向量
+                            feat = [0.0, 0.0, 0.0, 0.0, 0.0]
+                        batch_features.append(feat)
+                    physicochemical_features.append(batch_features)
+                
+                # 转换为张量并归一化
+                pc_features = torch.tensor(physicochemical_features, dtype=torch.float32, device=device)  # [batch_size, L, 5]
+                
+                # 归一化
+                stats = vocab.FEATURE_STATS
+                pc_features[:, :, 0] = (pc_features[:, :, 0] - stats['hydropathy']['mean']) / stats['hydropathy']['std']
+                pc_features[:, :, 1] = (pc_features[:, :, 1] - stats['charge']['mean']) / stats['charge']['std']
+                pc_features[:, :, 2] = (pc_features[:, :, 2] - stats['molecular_weight']['mean']) / stats['molecular_weight']['std']
+                pc_features[:, :, 3] = (pc_features[:, :, 3] - stats['h_donors']['mean']) / stats['h_donors']['std']
+                pc_features[:, :, 4] = (pc_features[:, :, 4] - stats['h_acceptors']['mean']) / stats['h_acceptors']['std']
+                
+                # 投影到hidden_dim
+                pc_features = self.physicochemical_proj(pc_features)  # [batch_size, L, hidden_dim]
+                
+                # 融合几何特征和理化特征（使用加法）
+                node_features = geometric_features + pc_features  # [batch_size, L, hidden_dim]
+            else:
+                # 如果没有提供残基类型，只使用几何特征
+                node_features = geometric_features
+        else:
+            # 不使用理化特征
+            node_features = geometric_features
         
         # 2. 构建图
         edge_index, edge_dist, edge_vec = self.build_graph(ca_coords, mask)
@@ -528,10 +590,10 @@ class BackboneEncoder(nn.Module):
             x = gnn_layer(x, edge_index, edge_features)
             x = layer_norm(x + x_residual)  # 残差连接 + 层归一化
         
-        # 6. 恢复批处理维度
+        # 7. 恢复批处理维度
         node_embeddings = x.view(batch_size, seq_len, self.hidden_dim)  # [batch_size, L, hidden_dim]
         
-        # 7. 应用掩码（如果有）
+        # 8. 应用掩码（如果有）
         if mask is not None:
             mask_expanded = mask.unsqueeze(-1).expand_as(node_embeddings)
             node_embeddings = node_embeddings * mask_expanded.float()

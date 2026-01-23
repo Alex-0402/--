@@ -10,12 +10,25 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from typing import Optional, Dict
 import os
+import numpy as np
 from tqdm import tqdm
 
 from models.encoder import BackboneEncoder
 from models.decoder import FragmentDecoder
 from data.vocabulary import get_vocab
 from training.masking import create_masks, apply_masks
+
+# 可选导入可视化模块（如果matplotlib未安装，可视化功能将被禁用）
+try:
+    from training.visualization import plot_training_curves, plot_loss_comparison
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    # 定义占位函数以避免后续调用错误
+    def plot_training_curves(*args, **kwargs):
+        pass
+    def plot_loss_comparison(*args, **kwargs):
+        pass
 
 
 class Trainer:
@@ -36,12 +49,16 @@ class Trainer:
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
         device: Optional[torch.device] = None,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 5e-4,
         weight_decay: float = 1e-5,
         mask_ratio: float = 0.15,
         masking_strategy: str = "random",
         ddp_enabled: bool = False,
-        rank: int = 0
+        rank: int = 0,
+        use_discrete_diffusion: bool = True,
+        num_diffusion_steps: int = 1000,
+        warmup_epochs: int = 20,
+        total_epochs: int = 300
     ):
         """
         初始化训练器
@@ -70,6 +87,11 @@ class Trainer:
         self.masking_strategy = masking_strategy
         self.ddp_enabled = ddp_enabled
         self.rank = rank
+        self.use_discrete_diffusion = use_discrete_diffusion
+        self.num_diffusion_steps = num_diffusion_steps
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.max_lr = learning_rate
         
         # 检查是否是 DDP 模型
         self.is_ddp_encoder = hasattr(encoder, 'module')
@@ -82,10 +104,15 @@ class Trainer:
             weight_decay=weight_decay
         )
         
-        # 学习率调度器
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=5
+        # 学习率调度器：LinearWarmupCosineAnnealingLR
+        # 先使用CosineAnnealingLR作为基础
+        self.cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=total_epochs - warmup_epochs,
+            eta_min=1e-6
         )
+        # Warmup阶段会手动处理
+        self.current_epoch = 0
         
         # 训练历史
         self.train_losses = []
@@ -208,13 +235,35 @@ class Trainer:
             # 如果没有有效的扭转角，损失为 0
             torsion_loss = torch.tensor(0.0, device=torsion_logits.device)
         
-        # 总损失
-        total_loss = fragment_loss + torsion_loss
+        # 3. 物理约束Loss：扭转角平滑性约束
+        # 计算相邻扭转角之间的差异，惩罚剧烈变化
+        structure_loss = torch.tensor(0.0, device=fragment_logits.device)
+        if torsion_logits.shape[1] > 1:
+            # 获取预测的扭转角（使用argmax或期望值）
+            # 为了可微，我们使用softmax后的期望值
+            torsion_probs = torch.softmax(torsion_logits, dim=-1)  # [batch_size, M, num_bins]
+            num_bins = torsion_logits.shape[-1]
+            # 将bin索引转换为角度（弧度）
+            bin_centers = torch.linspace(0, 2 * np.pi, num_bins, device=torsion_logits.device)
+            # 计算期望角度
+            expected_angles = torch.sum(torsion_probs * bin_centers.unsqueeze(0).unsqueeze(0), dim=-1)  # [batch_size, M]
+            
+            # 计算相邻角度之间的差异
+            angle_diff = expected_angles[:, 1:] - expected_angles[:, :-1]  # [batch_size, M-1]
+            # 将角度差归一化到 [-π, π] 范围
+            angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
+            # 平滑性约束：惩罚大的角度变化（L2正则化）
+            structure_loss = torch.mean(angle_diff ** 2)
+        
+        # 总损失（添加物理约束项，权重可调）
+        physical_constraint_weight = 0.1  # 物理约束权重
+        total_loss = fragment_loss + torsion_loss + physical_constraint_weight * structure_loss
         
         return {
             'total_loss': total_loss,
             'fragment_loss': fragment_loss,
-            'torsion_loss': torsion_loss
+            'torsion_loss': torsion_loss,
+            'structure_loss': structure_loss
         }
     
     def train_epoch(self) -> Dict[str, float]:
@@ -230,6 +279,7 @@ class Trainer:
         total_loss = 0.0
         total_fragment_loss = 0.0
         total_torsion_loss = 0.0
+        total_structure_loss = 0.0
         num_batches = 0
         
         pbar = tqdm(self.train_loader, desc="Training")
@@ -240,12 +290,37 @@ class Trainer:
             torsion_bins = batch['torsion_bins'].to(self.device)
             sequence_lengths = batch['sequence_lengths'].to(self.device)
             
-            # 创建掩码
-            fragment_masks = create_masks(
-                fragment_token_ids,
-                strategy=self.masking_strategy,
-                mask_ratio=self.mask_ratio
-            )
+            # 创建掩码（离散扩散模式：采样时间步）
+            current_mask_ratio = self.mask_ratio  # 用于监控
+            if self.use_discrete_diffusion:
+                # 为每个样本随机采样时间步 t ∈ [1, T]（归一化到 [0, 1]）
+                batch_size = fragment_token_ids.shape[0]
+                # 采样整数时间步 [1, T]
+                timesteps = torch.randint(
+                    1, self.num_diffusion_steps + 1,
+                    size=(batch_size,),
+                    device=self.device
+                ).float() / self.num_diffusion_steps  # 归一化到 [0, 1]
+                
+                # 计算动态mask_ratio（用于监控）
+                from training.masking import cosine_schedule
+                dynamic_mask_ratios = cosine_schedule(timesteps)
+                current_mask_ratio = dynamic_mask_ratios.mean().item()
+                
+                fragment_masks = create_masks(
+                    fragment_token_ids,
+                    strategy=self.masking_strategy,
+                    mask_ratio=self.mask_ratio,  # 作为默认值，会被覆盖
+                    timesteps=timesteps,
+                    use_cosine_schedule=True
+                )
+            else:
+                # 传统固定mask_ratio模式（向后兼容）
+                fragment_masks = create_masks(
+                    fragment_token_ids,
+                    strategy=self.masking_strategy,
+                    mask_ratio=self.mask_ratio
+                )
             
             # 应用掩码
             masked_fragments = apply_masks(fragment_token_ids, fragment_masks)
@@ -253,8 +328,9 @@ class Trainer:
             # 前向传播
             self.optimizer.zero_grad()
             
-            # Encoder
-            node_embeddings = self.encoder(backbone_coords, mask=None)
+            # Encoder（传递残基类型以支持理化特征）
+            residue_types = batch.get('residue_types', None)
+            node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=residue_types)
             
             # Decoder
             frag_logits, tors_logits = self.decoder(
@@ -289,19 +365,25 @@ class Trainer:
             total_loss += losses['total_loss'].item()
             total_fragment_loss += losses['fragment_loss'].item()
             total_torsion_loss += losses['torsion_loss'].item()
+            total_structure_loss += losses.get('structure_loss', torch.tensor(0.0)).item()
             num_batches += 1
             
             # 更新进度条
+            current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f"{losses['total_loss'].item():.4f}",
                 'frag': f"{losses['fragment_loss'].item():.4f}",
-                'tors': f"{losses['torsion_loss'].item():.4f}"
+                'tors': f"{losses['torsion_loss'].item():.4f}",
+                'struct': f"{losses.get('structure_loss', torch.tensor(0.0)).item():.4f}",
+                'mask_ratio': f"{current_mask_ratio:.3f}",
+                'lr': f"{current_lr:.2e}"
             })
         
         return {
             'loss': total_loss / num_batches,
             'fragment_loss': total_fragment_loss / num_batches,
-            'torsion_loss': total_torsion_loss / num_batches
+            'torsion_loss': total_torsion_loss / num_batches,
+            'structure_loss': total_structure_loss / num_batches
         }
     
     def validate(self) -> Dict[str, float]:
@@ -320,6 +402,7 @@ class Trainer:
         total_loss = 0.0
         total_fragment_loss = 0.0
         total_torsion_loss = 0.0
+        total_structure_loss = 0.0
         num_batches = 0
         
         with torch.no_grad():
@@ -335,7 +418,7 @@ class Trainer:
                         print(f"  ⚠️  警告: backbone_coords 包含 NaN/Inf，跳过此批次")
                     continue
                 
-                # 创建掩码
+                # 创建掩码（验证时使用固定mask_ratio，不采样时间步）
                 fragment_masks = create_masks(
                     fragment_token_ids,
                     strategy=self.masking_strategy,
@@ -345,9 +428,10 @@ class Trainer:
                 # 应用掩码
                 masked_fragments = apply_masks(fragment_token_ids, fragment_masks)
                 
-                # 前向传播
+                # 前向传播（传递残基类型以支持理化特征）
                 try:
-                    node_embeddings = self.encoder(backbone_coords, mask=None)
+                    residue_types = batch.get('residue_types', None)
+                    node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=residue_types)
                     if torch.isnan(node_embeddings).any() or torch.isinf(node_embeddings).any():
                         if self.rank == 0:
                             print(f"  ⚠️  警告: encoder 输出包含 NaN/Inf，跳过此批次")
@@ -405,6 +489,7 @@ class Trainer:
                 total_loss += losses['total_loss'].item()
                 total_fragment_loss += losses['fragment_loss'].item()
                 total_torsion_loss += losses['torsion_loss'].item()
+                total_structure_loss += losses.get('structure_loss', torch.tensor(0.0)).item()
                 num_batches += 1
         
         # 如果没有批次，返回空字典
@@ -422,10 +507,13 @@ class Trainer:
                 print(f"  ⚠️  警告: 验证损失为 NaN，可能是数据问题")
             return {}
         
+        avg_struct_loss = total_structure_loss / num_batches if num_batches > 0 else 0.0
+        
         return {
             'loss': avg_loss,
             'fragment_loss': avg_frag_loss,
-            'torsion_loss': avg_tors_loss
+            'torsion_loss': avg_tors_loss,
+            'structure_loss': avg_struct_loss
         }
     
     def train(
@@ -433,7 +521,9 @@ class Trainer:
         num_epochs: int,
         save_dir: Optional[str] = None,
         save_every: int = 10,
-        train_sampler: Optional[torch.utils.data.Sampler] = None
+        train_sampler: Optional[torch.utils.data.Sampler] = None,
+        visualize: bool = True,
+        plot_every: int = 5
     ):
         """
         训练模型
@@ -443,15 +533,24 @@ class Trainer:
             save_dir: 保存目录
             save_every: 每 N 个 epoch 保存一次
             train_sampler: 训练采样器（DDP 时使用 DistributedSampler）
+            visualize: 是否启用可视化
+            plot_every: 每 N 个 epoch 绘制一次图表
         """
         if save_dir and self.rank == 0:
             os.makedirs(save_dir, exist_ok=True)
         
         if self.rank == 0:
             print(f"开始训练，设备: {self.device}")
-            print(f"掩码策略: {self.masking_strategy}, 掩码比例: {self.mask_ratio}")
+            if self.use_discrete_diffusion:
+                print(f"扩散模型: 启用 (时间步数: {self.num_diffusion_steps})")
+                print(f"掩码策略: {self.masking_strategy}, 掩码比例: 动态 (Cosine Schedule)")
+            else:
+                print(f"掩码策略: {self.masking_strategy}, 掩码比例: {self.mask_ratio} (固定)")
+            print(f"学习率调度: LinearWarmup ({self.warmup_epochs} epochs) + CosineAnnealing")
+            print(f"最大学习率: {self.max_lr:.2e}")
         
         for epoch in range(1, num_epochs + 1):
+            self.current_epoch = epoch
             # DDP 模式下，每个 epoch 需要设置 sampler 的 epoch
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -467,7 +566,8 @@ class Trainer:
             if self.rank == 0:
                 print(f"Train Loss: {train_metrics['loss']:.4f} "
                       f"(Fragment: {train_metrics['fragment_loss']:.4f}, "
-                      f"Torsion: {train_metrics['torsion_loss']:.4f})")
+                      f"Torsion: {train_metrics['torsion_loss']:.4f}, "
+                      f"Structure: {train_metrics.get('structure_loss', 0.0):.4f})")
             
             # 验证
             if self.val_loader is not None:
@@ -479,10 +579,11 @@ class Trainer:
                     if self.rank == 0:
                         print(f"Val Loss: {val_metrics['loss']:.4f} "
                               f"(Fragment: {val_metrics['fragment_loss']:.4f}, "
-                              f"Torsion: {val_metrics['torsion_loss']:.4f})")
+                              f"Torsion: {val_metrics['torsion_loss']:.4f}, "
+                              f"Structure: {val_metrics.get('structure_loss', 0.0):.4f})")
                     
-                    # 更新学习率
-                    self.scheduler.step(val_metrics['loss'])
+                    # 更新学习率（使用WarmupCosineAnnealing调度器）
+                    self._update_learning_rate(epoch)
                     
                     # 保存最佳模型（只在 rank 0 保存）
                     if val_metrics['loss'] < self.best_val_loss:
@@ -503,10 +604,48 @@ class Trainer:
                     os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pt'),
                     epoch, train_metrics['loss']
                 )
+            
+            # 定期可视化（只在 rank 0 保存）
+            if visualize and VISUALIZATION_AVAILABLE and save_dir and epoch % plot_every == 0 and self.rank == 0:
+                try:
+                    plot_path = os.path.join(save_dir, f'training_curves_epoch_{epoch}.png')
+                    plot_training_curves(
+                        self.train_losses,
+                        self.val_losses if self.val_loader is not None else None,
+                        save_path=plot_path
+                    )
+                except Exception as e:
+                    if self.rank == 0:
+                        print(f"Warning: Failed to plot training curves: {e}")
+            elif visualize and not VISUALIZATION_AVAILABLE and self.rank == 0:
+                if epoch == 1:
+                    print("   ⚠️  可视化已请求但 matplotlib 未安装，跳过绘图")
+        
+        # 训练结束后生成最终可视化（只在 rank 0 保存）
+        if visualize and VISUALIZATION_AVAILABLE and save_dir and self.rank == 0:
+            try:
+                final_plot_path = os.path.join(save_dir, 'training_curves_final.png')
+                plot_training_curves(
+                    self.train_losses,
+                    self.val_losses if self.val_loader is not None else None,
+                    save_path=final_plot_path
+                )
+                # 同时生成简化的对比图
+                simple_plot_path = os.path.join(save_dir, 'loss_comparison.png')
+                plot_loss_comparison(
+                    self.train_losses,
+                    self.val_losses if self.val_loader is not None else None,
+                    save_path=simple_plot_path
+                )
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"Warning: Failed to plot final training curves: {e}")
         
         if self.rank == 0:
             print("\n" + "=" * 60)
             print("训练完成！")
+            if visualize and save_dir:
+                print(f"可视化图表已保存到: {save_dir}")
             print("=" * 60)
     
     def save_checkpoint(
@@ -520,16 +659,46 @@ class Trainer:
         encoder_state_dict = self.encoder.module.state_dict() if self.is_ddp_encoder else self.encoder.state_dict()
         decoder_state_dict = self.decoder.module.state_dict() if self.is_ddp_decoder else self.decoder.state_dict()
         
-        torch.save({
+        checkpoint_data = {
             'epoch': epoch,
             'encoder_state_dict': encoder_state_dict,
             'decoder_state_dict': decoder_state_dict,
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
             'loss': loss,
             'train_losses': self.train_losses,
-            'val_losses': self.val_losses
-        }, path)
+            'val_losses': self.val_losses,
+            'warmup_epochs': self.warmup_epochs,
+            'total_epochs': self.total_epochs,
+            'max_lr': self.max_lr
+        }
+        # 保存cosine scheduler状态（如果存在）
+        if hasattr(self, 'cosine_scheduler'):
+            checkpoint_data['cosine_scheduler_state_dict'] = self.cosine_scheduler.state_dict()
+        torch.save(checkpoint_data, path)
+    
+    def _update_learning_rate(self, epoch: int):
+        """
+        更新学习率：LinearWarmup + CosineAnnealing
+        
+        Args:
+            epoch: 当前epoch（从1开始）
+        """
+        if epoch <= self.warmup_epochs:
+            # Warmup阶段：线性增长
+            warmup_lr = self.max_lr * (epoch / self.warmup_epochs)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = warmup_lr
+        else:
+            # CosineAnnealing阶段
+            # 注意：CosineAnnealingLR的step需要在warmup之后调用
+            if epoch == self.warmup_epochs + 1:
+                # 第一次进入cosine阶段，重置scheduler
+                self.cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=self.total_epochs - self.warmup_epochs,
+                    eta_min=1e-6
+                )
+            self.cosine_scheduler.step()
     
     def load_checkpoint(self, path: str):
         """加载检查点"""
@@ -537,5 +706,8 @@ class Trainer:
         self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
         self.decoder.load_state_dict(checkpoint['decoder_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            # 兼容旧的检查点格式
+            if hasattr(self, 'scheduler'):
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         return checkpoint['epoch']

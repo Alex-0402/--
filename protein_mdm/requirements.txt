@@ -5,6 +5,7 @@ biopython>=1.79
 einops>=0.6.0
 tqdm>=4.64.0
 requests>=2.28.0
+matplotlib>=3.5.0
 
 # Graph neural networks (required for BackboneEncoder)
 torch-geometric>=2.3.0

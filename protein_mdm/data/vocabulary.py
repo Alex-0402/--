@@ -9,8 +9,10 @@ Author: Research Team
 Date: 2024
 """
 
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from enum import IntEnum
+import torch
+import numpy as np
 
 
 class SpecialTokens(IntEnum):
@@ -47,6 +49,52 @@ class FragmentVocab:
         "THIOL",            # -SH
         "BRANCH_CH",        # >CH- (分叉点，用于支链氨基酸)
     ]
+    
+    # 20种标准氨基酸的理化特征
+    # 特征向量包括: [疏水性(Hydropathy), 电荷(Charge), 分子量(MW), 氢键供体数(H-donors), 氢键受体数(H-acceptors)]
+    # 数据来源: Kyte-Doolittle疏水性指数, 标准分子量, 氢键能力
+    PHYSICOCHEMICAL_FEATURES: Dict[str, List[float]] = {
+        # Non-polar aliphatic
+        "ALA": [1.8, 0.0, 89.09, 0, 0],      # 疏水, 中性, 小分子
+        "VAL": [4.2, 0.0, 117.15, 0, 0],     # 疏水, 中性
+        "LEU": [3.8, 0.0, 131.17, 0, 0],     # 疏水, 中性
+        "ILE": [4.5, 0.0, 131.17, 0, 0],     # 疏水, 中性
+        "MET": [1.9, 0.0, 149.21, 0, 1],     # 疏水, 中性, 含S
+        
+        # Aromatic
+        "PHE": [2.8, 0.0, 165.19, 0, 0],     # 疏水, 中性, 芳香
+        "TYR": [-1.3, 0.0, 181.19, 1, 1],    # 亲水, 中性, 芳香, 含OH
+        "TRP": [-0.9, 0.0, 204.23, 1, 1],    # 亲水, 中性, 芳香, 含N
+        
+        # Polar uncharged
+        "SER": [-0.8, 0.0, 105.09, 1, 1],    # 亲水, 中性, 含OH
+        "THR": [-0.7, 0.0, 119.12, 1, 1],    # 亲水, 中性, 含OH
+        "ASN": [-3.5, 0.0, 132.12, 2, 2],    # 亲水, 中性, 含酰胺
+        "GLN": [-3.5, 0.0, 146.15, 2, 2],    # 亲水, 中性, 含酰胺
+        
+        # Positively charged
+        "LYS": [-3.9, 1.0, 146.19, 2, 1],    # 亲水, 正电, 含NH3+
+        "ARG": [-4.5, 1.0, 174.20, 4, 1],    # 亲水, 正电, 含胍基
+        "HIS": [-3.2, 0.5, 155.16, 2, 2],    # 亲水, 弱正电, 含咪唑
+        
+        # Negatively charged
+        "ASP": [-3.5, -1.0, 133.10, 1, 2],   # 亲水, 负电, 含COO-
+        "GLU": [-3.5, -1.0, 147.13, 1, 2],   # 亲水, 负电, 含COO-
+        
+        # Special cases
+        "CYS": [2.5, 0.0, 121.16, 1, 0],     # 疏水, 中性, 含SH
+        "GLY": [-0.4, 0.0, 75.07, 0, 0],     # 亲水, 中性, 最小
+        "PRO": [-1.6, 0.0, 115.13, 0, 0],    # 亲水, 中性, 环状
+    }
+    
+    # 特征归一化参数（用于标准化）
+    FEATURE_STATS = {
+        'hydropathy': {'mean': 0.0, 'std': 2.5},      # 归一化到 [-1, 1] 范围
+        'charge': {'mean': 0.0, 'std': 0.5},          # 归一化到 [-2, 2] 范围
+        'molecular_weight': {'mean': 130.0, 'std': 30.0},  # 归一化到 [0, 200] 范围
+        'h_donors': {'mean': 1.0, 'std': 1.2},       # 归一化到 [0, 4] 范围
+        'h_acceptors': {'mean': 0.8, 'std': 0.9},     # 归一化到 [0, 2] 范围
+    }
     
     def __init__(self):
         """Initialize the vocabulary with token-to-index mappings"""
@@ -163,6 +211,157 @@ class FragmentVocab:
     
     def __repr__(self) -> str:
         return f"FragmentVocab(vocab_size={self.vocab_size}, fragments={len(self.FRAGMENT_TOKENS)})"
+    
+    def get_physicochemical_embedding(
+        self,
+        token_ids: torch.Tensor,
+        normalize: bool = True
+    ) -> torch.Tensor:
+        """
+        将Token ID映射为理化特征向量
+        
+        注意：此方法处理的是片段Token ID，而不是残基名称。
+        由于片段Token可能来自不同的残基，我们需要一个映射策略：
+        - 对于特殊Token（PAD, MASK等），返回零向量
+        - 对于片段Token，返回该片段所属残基的平均理化特征
+        
+        Args:
+            token_ids: Token ID张量 [batch_size, seq_len] 或 [seq_len]
+            normalize: 是否归一化特征（默认True）
+        
+        Returns:
+            理化特征向量 [batch_size, seq_len, 5] 或 [seq_len, 5]
+                特征维度: [疏水性, 电荷, 分子量, 氢键供体数, 氢键受体数]
+        """
+        # 确保是2D张量
+        if token_ids.dim() == 1:
+            token_ids = token_ids.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
+        batch_size, seq_len = token_ids.shape
+        device = token_ids.device
+        
+        # 片段Token到特征的映射（使用固定索引）
+        # 索引: PAD=0, MASK=1, BOS=2, EOS=3, 然后片段从4开始
+        # 片段顺序: METHYL(4), METHYLENE(5), HYDROXYL(6), PHENYL(7), AMINE(8), 
+        #          CARBOXYL(9), AMIDE(10), GUANIDINE(11), IMIDAZOLE(12), INDOLE(13), 
+        #          THIOL(14), BRANCH_CH(15)
+        fragment_to_features = {
+            # 特殊Token -> 零向量
+            SpecialTokens.PAD: [0.0, 0.0, 0.0, 0.0, 0.0],
+            SpecialTokens.MASK: [0.0, 0.0, 0.0, 0.0, 0.0],
+            SpecialTokens.BOS: [0.0, 0.0, 0.0, 0.0, 0.0],
+            SpecialTokens.EOS: [0.0, 0.0, 0.0, 0.0, 0.0],
+            
+            # 片段Token -> 基于常见残基的平均特征
+            # METHYL (4): 主要来自疏水残基 (ALA, VAL, LEU, ILE)
+            4: [
+                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["ALA"][0], 
+                              self.PHYSICOCHEMICAL_FEATURES["VAL"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["LEU"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["ILE"][0]])),
+                0.0,
+                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["ALA"][2], 
+                              self.PHYSICOCHEMICAL_FEATURES["VAL"][2],
+                              self.PHYSICOCHEMICAL_FEATURES["LEU"][2],
+                              self.PHYSICOCHEMICAL_FEATURES["ILE"][2]])),
+                0.0, 0.0
+            ],
+            # METHYLENE (5): 中性特征
+            5: [0.0, 0.0, 14.0, 0.0, 0.0],
+            # HYDROXYL (6): 亲水特征 (SER, THR, TYR)
+            6: [
+                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["SER"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["THR"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["TYR"][0]])),
+                0.0, 17.0, 1.0, 1.0
+            ],
+            # PHENYL (7): 芳香特征 (PHE, TYR)
+            7: [
+                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["PHE"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["TYR"][0]])),
+                0.0, 77.0, 0.0, 0.0
+            ],
+            # AMINE (8): 正电特征 (LYS)
+            8: [
+                float(self.PHYSICOCHEMICAL_FEATURES["LYS"][0]),
+                1.0, 17.0, 2.0, 1.0
+            ],
+            # CARBOXYL (9): 负电特征 (ASP, GLU)
+            9: [
+                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["ASP"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["GLU"][0]])),
+                -1.0, 45.0, 0.0, 2.0
+            ],
+            # AMIDE (10): 亲水特征 (ASN, GLN)
+            10: [
+                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["ASN"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["GLN"][0]])),
+                0.0, 44.0, 2.0, 2.0
+            ],
+            # GUANIDINE (11): 正电特征 (ARG)
+            11: [
+                float(self.PHYSICOCHEMICAL_FEATURES["ARG"][0]),
+                1.0, 59.0, 4.0, 1.0
+            ],
+            # IMIDAZOLE (12): 弱正电特征 (HIS)
+            12: [
+                float(self.PHYSICOCHEMICAL_FEATURES["HIS"][0]),
+                0.5, 68.0, 2.0, 2.0
+            ],
+            # INDOLE (13): 芳香特征 (TRP)
+            13: [
+                float(self.PHYSICOCHEMICAL_FEATURES["TRP"][0]),
+                0.0, 117.0, 1.0, 1.0
+            ],
+            # THIOL (14): 疏水特征 (CYS, MET)
+            14: [
+                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["CYS"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["MET"][0]])),
+                0.0, 33.0, 1.0, 0.0
+            ],
+            # BRANCH_CH (15): 支链特征 (VAL, LEU, ILE, THR)
+            15: [
+                float(np.mean([self.PHYSICOCHEMICAL_FEATURES["VAL"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["LEU"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["ILE"][0],
+                              self.PHYSICOCHEMICAL_FEATURES["THR"][0]])),
+                0.0, 13.0, 0.0, 0.0
+            ],
+        }
+        
+        # 使用向量化操作构建特征矩阵（更高效）
+        token_ids_flat = token_ids.flatten().cpu().numpy()
+        features_list = []
+        for token_id in token_ids_flat:
+            token_id_int = int(token_id)
+            if token_id_int in fragment_to_features:
+                feat = fragment_to_features[token_id_int]
+            else:
+                # 未知Token，使用零向量
+                feat = [0.0, 0.0, 0.0, 0.0, 0.0]
+            features_list.append(feat)
+        
+        # 转换为张量
+        features = torch.tensor(features_list, dtype=torch.float32, device=device)  # [batch_size * seq_len, 5]
+        features = features.view(batch_size, seq_len, 5)  # [batch_size, seq_len, 5]
+        
+        # 归一化（可选）
+        if normalize:
+            # 对每个特征维度进行归一化
+            stats = self.FEATURE_STATS
+            features[:, :, 0] = (features[:, :, 0] - stats['hydropathy']['mean']) / stats['hydropathy']['std']  # 疏水性
+            features[:, :, 1] = (features[:, :, 1] - stats['charge']['mean']) / stats['charge']['std']  # 电荷
+            features[:, :, 2] = (features[:, :, 2] - stats['molecular_weight']['mean']) / stats['molecular_weight']['std']  # 分子量
+            features[:, :, 3] = (features[:, :, 3] - stats['h_donors']['mean']) / stats['h_donors']['std']  # 氢键供体
+            features[:, :, 4] = (features[:, :, 4] - stats['h_acceptors']['mean']) / stats['h_acceptors']['std']  # 氢键受体
+        
+        if squeeze_output:
+            features = features.squeeze(0)
+        
+        return features
 
 
 # Global vocabulary instance (singleton pattern)

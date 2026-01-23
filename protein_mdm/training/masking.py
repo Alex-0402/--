@@ -2,17 +2,38 @@
 掩码策略模块
 
 用于训练时创建掩码，模拟掩码扩散模型的训练过程。
+支持离散扩散模型的时间步调度（Cosine Schedule）。
 """
 
 import torch
+import numpy as np
 from typing import Optional
 from data.vocabulary import SpecialTokens
+
+
+def cosine_schedule(t: torch.Tensor) -> torch.Tensor:
+    """
+    Cosine Schedule: 根据时间步 t (0 -> 1) 计算当前的 mask_ratio
+    
+    Args:
+        t: 归一化时间步 [batch_size] 或标量，范围 [0, 1]
+           t=0 时 mask_ratio=0，t=1 时 mask_ratio=1
+    
+    Returns:
+        mask_ratio: [batch_size] 或标量，范围 [0, 1]
+    """
+    # Cosine schedule: mask_ratio = 1 - cos(π * t / 2)
+    # 当 t=0 时，mask_ratio=0；当 t=1 时，mask_ratio=1
+    mask_ratio = 1.0 - torch.cos(np.pi * t / 2.0)
+    return mask_ratio
 
 
 def create_masks(
     fragment_token_ids: torch.Tensor,
     strategy: str = "random",
     mask_ratio: float = 0.15,
+    timesteps: Optional[torch.Tensor] = None,
+    use_cosine_schedule: bool = False,
     **kwargs
 ) -> torch.Tensor:
     """
@@ -21,7 +42,9 @@ def create_masks(
     Args:
         fragment_token_ids: 片段 Token IDs [batch_size, M]
         strategy: 掩码策略 ("random", "block")
-        mask_ratio: 掩码比例（0.0 到 1.0）
+        mask_ratio: 掩码比例（0.0 到 1.0），如果提供了 timesteps 且 use_cosine_schedule=True，则会被覆盖
+        timesteps: 可选时间步 [batch_size] 或标量，范围 [0, 1]（用于离散扩散）
+        use_cosine_schedule: 是否使用 Cosine Schedule（默认False，保持向后兼容）
         **kwargs: 其他策略参数
     
     Returns:
@@ -30,12 +53,29 @@ def create_masks(
     batch_size, num_fragments = fragment_token_ids.shape
     device = fragment_token_ids.device
     
+    # 如果提供了时间步且使用 Cosine Schedule，计算动态 mask_ratio
+    if timesteps is not None and use_cosine_schedule:
+        if timesteps.dim() == 0:
+            # 标量时间步，扩展到batch
+            timesteps = timesteps.expand(batch_size)
+        # 计算每个样本的 mask_ratio
+        dynamic_mask_ratios = cosine_schedule(timesteps)  # [batch_size]
+    else:
+        # 使用固定的 mask_ratio
+        if isinstance(mask_ratio, torch.Tensor):
+            dynamic_mask_ratios = mask_ratio
+        else:
+            dynamic_mask_ratios = torch.full((batch_size,), mask_ratio, device=device)
+    
     masks = []
     
     for i in range(batch_size):
+        # 获取当前样本的 mask_ratio
+        current_mask_ratio = dynamic_mask_ratios[i].item() if isinstance(dynamic_mask_ratios, torch.Tensor) else dynamic_mask_ratios
+        
         if strategy == "random":
             # 随机掩码
-            num_masked = int(num_fragments * mask_ratio)
+            num_masked = int(num_fragments * current_mask_ratio)
             mask = torch.zeros(num_fragments, dtype=torch.bool, device=device)
             if num_masked > 0:
                 indices = torch.randperm(num_fragments, device=device)[:num_masked]

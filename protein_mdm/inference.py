@@ -31,6 +31,14 @@ def main():
                        help="设备 (cuda/cpu)")
     parser.add_argument("--hidden_dim", type=int, default=256,
                        help="隐藏层维度（需与训练时一致）")
+    parser.add_argument("--num_encoder_layers", type=int, default=3,
+                       help="Encoder 层数（需与训练时一致）")
+    parser.add_argument("--num_decoder_layers", type=int, default=3,
+                       help="Decoder 层数（需与训练时一致）")
+    parser.add_argument("--num_heads", type=int, default=8,
+                       help="注意力头数（需与训练时一致）")
+    parser.add_argument("--num_iterations", type=int, default=10,
+                       help="自适应迭代推理的迭代轮数（默认10）")
     
     args = parser.parse_args()
     
@@ -52,12 +60,17 @@ def main():
     print("\n1. 加载模型...")
     vocab = get_vocab()
     
-    encoder = BackboneEncoder(hidden_dim=args.hidden_dim, num_layers=3)
+    encoder = BackboneEncoder(
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_encoder_layers
+    )
     decoder = FragmentDecoder(
         input_dim=args.hidden_dim,
         vocab_size=vocab.get_vocab_size(),
         num_torsion_bins=72,
-        hidden_dim=args.hidden_dim
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_decoder_layers,
+        num_heads=args.num_heads
     )
     
     checkpoint = torch.load(args.model_path, map_location=device)
@@ -81,31 +94,72 @@ def main():
     print(f"   序列长度: {sequence_length}")
     print(f"   骨架形状: {backbone_coords.shape}")
     
-    # 生成侧链
-    print("\n3. 生成侧链...")
-    with torch.no_grad():
-        # Encoder
-        node_embeddings = encoder(backbone_coords)
+    # 生成侧链（自适应迭代推理）
+    print("\n3. 生成侧链（自适应迭代推理）...")
+    num_iterations = args.num_iterations
+    print(f"   迭代轮数: {num_iterations}")
         
-        # 创建初始片段序列（全 MASK）
-        frag_seq_len = len(sample['fragment_token_ids'])
-        target_fragments = torch.full(
-            (1, frag_seq_len),
-            vocab.token_to_idx["[MASK]"],
-            dtype=torch.long,
-            device=device
-        )
-        
-        # Decoder（迭代生成）
-        # 简化版本：一次性生成所有片段
-        frag_logits, tors_logits = decoder(
-            node_embeddings=node_embeddings,
-            target_fragments=target_fragments
-        )
-        
-        # 获取预测
-        fragment_predictions = torch.argmax(frag_logits, dim=-1)[0]
-        torsion_predictions = torch.argmax(tors_logits, dim=-1)[0]
+        with torch.no_grad():
+            # Encoder
+            residue_types = sample.get('residue_types', None)
+            if residue_types is not None:
+                residue_types = [residue_types]  # 包装成batch格式
+            node_embeddings = encoder(backbone_coords, residue_types=residue_types)
+            
+            # 创建初始片段序列（全 MASK）
+            frag_seq_len = len(sample['fragment_token_ids'])
+            mask_token_id = vocab.token_to_idx["[MASK]"]
+            target_fragments = torch.full(
+                (1, frag_seq_len),
+                mask_token_id,
+                dtype=torch.long,
+                device=device
+            )
+            
+            # 迭代解码循环（MaskGIT风格）
+            for k in range(num_iterations):
+                # 当前保留比例（逐渐增加）
+                keep_ratio = k / num_iterations  # 从0到1
+                
+                # Decoder预测
+                frag_logits, tors_logits = decoder(
+                    node_embeddings=node_embeddings,
+                    target_fragments=target_fragments
+                )
+                
+                # 计算每个位置的置信度（使用最大概率作为置信度）
+                frag_probs = torch.softmax(frag_logits, dim=-1)  # [1, M, vocab_size]
+                max_probs, _ = torch.max(frag_probs, dim=-1)  # [1, M] - 每个位置的最大概率
+                confidence_scores = max_probs[0]  # [M]
+                
+                # 计算需要保留的Token数量
+                num_to_keep = int(frag_seq_len * keep_ratio)
+                
+                if k < num_iterations - 1:
+                    # 不是最后一轮：根据置信度保留高置信度的Token，其余重新Mask
+                    if num_to_keep > 0:
+                        # 获取置信度最高的位置
+                        _, top_indices = torch.topk(confidence_scores, k=num_to_keep, largest=True)
+                        
+                        # 更新target_fragments：保留高置信度位置的预测，其余重新Mask
+                        predicted_tokens = torch.argmax(frag_logits, dim=-1)[0]  # [M]
+                        target_fragments[0, top_indices] = predicted_tokens[top_indices]
+                        # 其余位置重新Mask
+                        mask_positions = torch.ones(frag_seq_len, dtype=torch.bool, device=device)
+                        mask_positions[top_indices] = False
+                        target_fragments[0, mask_positions] = mask_token_id
+                    else:
+                        # 第一轮：全部保持Mask
+                        pass
+                    
+                    if (k + 1) % 2 == 0 or k == 0:
+                        print(f"   迭代 {k+1}/{num_iterations}: 保留 {num_to_keep}/{frag_seq_len} 个Token "
+                              f"(平均置信度: {confidence_scores.mean().item():.3f})")
+                else:
+                    # 最后一轮：使用所有预测
+                    fragment_predictions = torch.argmax(frag_logits, dim=-1)[0]
+                    torsion_predictions = torch.argmax(tors_logits, dim=-1)[0]
+                    print(f"   迭代 {k+1}/{num_iterations}: 完成生成")
     
     # 处理结果
     print("\n4. 结果:")
