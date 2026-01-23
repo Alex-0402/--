@@ -14,7 +14,7 @@ protein_mdm/
 │
 ├── models/                    # 模型架构模块
 │   ├── __init__.py           # 模块导出
-│   ├── encoder.py            # 骨架编码器（占位符，待集成 GVP）
+│   ├── encoder.py            # 骨架编码器（基于 torch-geometric）
 │   └── decoder.py            # 片段和扭转角预测器
 │
 ├── utils/                     # 工具函数模块
@@ -28,7 +28,6 @@ protein_mdm/
 ├── test_all.py               # ⭐ 综合测试脚本
 │
 ├── requirements.txt          # 核心依赖列表
-├── requirements-optional.txt # 可选依赖列表
 ├── setup_env.sh              # 环境设置脚本
 ├── .gitignore                # Git 忽略文件
 ├── README.md                  # 项目说明文档
@@ -136,9 +135,9 @@ protein_mdm/
 
 **核心类**: `BackboneEncoder`
 
-**当前状态**: ⚠️ **占位符实现**
-- 使用简单的 MLP 作为占位符
-- **TODO**: 集成 GVP (Geometric Vector Perceptron) 以实现 SE(3) 等变性
+**当前状态**: ✅ **已实现**
+- 使用 torch-geometric 实现几何图神经网络编码器
+- 支持残基类型嵌入和邻居图构建
 
 **输入/输出**:
 - 输入: `backbone_coords` [batch_size, L, 4, 3]

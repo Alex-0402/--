@@ -98,8 +98,8 @@ def main():
     print("\n3. 生成侧链（自适应迭代推理）...")
     num_iterations = args.num_iterations
     print(f"   迭代轮数: {num_iterations}")
-        
-        with torch.no_grad():
+    
+    with torch.no_grad():
             # Encoder
             residue_types = sample.get('residue_types', None)
             if residue_types is not None:

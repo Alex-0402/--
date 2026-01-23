@@ -523,7 +523,10 @@ class Trainer:
         save_every: int = 10,
         train_sampler: Optional[torch.utils.data.Sampler] = None,
         visualize: bool = True,
-        plot_every: int = 5
+        plot_every: int = 5,
+        resume_from: Optional[str] = None,
+        early_stopping_patience: Optional[int] = None,
+        early_stopping_min_delta: float = 0.0
     ):
         """
         训练模型
@@ -535,9 +538,27 @@ class Trainer:
             train_sampler: 训练采样器（DDP 时使用 DistributedSampler）
             visualize: 是否启用可视化
             plot_every: 每 N 个 epoch 绘制一次图表
+            early_stopping_patience: 早停耐心值，如果验证损失连续N轮不下降则停止训练（None表示禁用）
+            early_stopping_min_delta: 早停最小改进阈值，只有改进超过此值才认为是有效改进
         """
         if save_dir and self.rank == 0:
             os.makedirs(save_dir, exist_ok=True)
+        
+        # 如果指定了恢复训练，加载checkpoint
+        start_epoch = 1
+        if resume_from is not None:
+            if self.rank == 0:
+                print(f"\n从检查点恢复训练: {resume_from}")
+            start_epoch = self.load_checkpoint(resume_from)
+            if self.rank == 0:
+                print(f"✅ 已加载检查点，从 epoch {start_epoch} 继续训练")
+                print(f"   训练历史: {len(self.train_losses)} 个epoch")
+                if self.val_loader is not None:
+                    print(f"   验证历史: {len(self.val_losses)} 个epoch")
+        
+        # 早停相关变量
+        patience_counter = 0
+        best_val_loss_for_patience = float('inf')
         
         if self.rank == 0:
             print(f"开始训练，设备: {self.device}")
@@ -548,8 +569,12 @@ class Trainer:
                 print(f"掩码策略: {self.masking_strategy}, 掩码比例: {self.mask_ratio} (固定)")
             print(f"学习率调度: LinearWarmup ({self.warmup_epochs} epochs) + CosineAnnealing")
             print(f"最大学习率: {self.max_lr:.2e}")
+            if early_stopping_patience is not None:
+                print(f"早停: 启用 (patience={early_stopping_patience}, min_delta={early_stopping_min_delta:.6f})")
+            if resume_from:
+                print(f"恢复训练: 从 epoch {start_epoch} 继续，目标 {num_epochs} epochs")
         
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(start_epoch, num_epochs + 1):
             self.current_epoch = epoch
             # DDP 模式下，每个 epoch 需要设置 sampler 的 epoch
             if train_sampler is not None:
@@ -572,6 +597,10 @@ class Trainer:
             # 验证
             if self.val_loader is not None:
                 val_metrics = self.validate()
+                # 确保所有rank都完成了验证
+                if self.ddp_enabled:
+                    import torch.distributed as dist
+                    dist.barrier()
                 self.val_losses.append(val_metrics)
                 
                 # 只有当验证指标不为空时才处理
@@ -589,57 +618,115 @@ class Trainer:
                     if val_metrics['loss'] < self.best_val_loss:
                         self.best_val_loss = val_metrics['loss']
                         if save_dir and self.rank == 0:
+                            # 在保存前添加barrier，确保所有rank都完成了验证
+                            if self.ddp_enabled:
+                                import torch.distributed as dist
+                                dist.barrier()  # 等待所有rank完成验证
                             self.save_checkpoint(
                                 os.path.join(save_dir, 'best_model.pt'),
                                 epoch, val_metrics['loss']
                             )
                             print(f"✅ 保存最佳模型 (val_loss: {val_metrics['loss']:.4f})")
+                            # 保存后再次barrier，确保保存完成
+                            if self.ddp_enabled:
+                                dist.barrier()
+                    
+                    # 早停检查
+                    if early_stopping_patience is not None:
+                        # 检查是否有显著改进（超过min_delta）
+                        improvement = best_val_loss_for_patience - val_metrics['loss']
+                        if improvement > early_stopping_min_delta:
+                            # 有显著改进，重置计数器
+                            best_val_loss_for_patience = val_metrics['loss']
+                            patience_counter = 0
+                            if self.rank == 0:
+                                print(f"   早停计数器重置 (改进: {improvement:.6f})")
+                        else:
+                            # 没有显著改进，增加计数器
+                            patience_counter += 1
+                            if self.rank == 0:
+                                print(f"   早停计数器: {patience_counter}/{early_stopping_patience} (改进: {improvement:.6f})")
+                            
+                            # 如果达到耐心值，停止训练
+                            if patience_counter >= early_stopping_patience:
+                                if self.rank == 0:
+                                    print(f"\n{'='*60}")
+                                    print(f"⚠️  早停触发: 验证损失连续 {early_stopping_patience} 轮未改进")
+                                    print(f"   最佳验证损失: {best_val_loss_for_patience:.4f} (Epoch {epoch - patience_counter})")
+                                    print(f"   当前验证损失: {val_metrics['loss']:.4f}")
+                                    print(f"{'='*60}\n")
+                                break
                 else:
                     if self.rank == 0:
                         print("⚠️  验证集为空，跳过验证")
             
             # 定期保存（只在 rank 0 保存）
-            if save_dir and epoch % save_every == 0 and self.rank == 0:
-                self.save_checkpoint(
-                    os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pt'),
-                    epoch, train_metrics['loss']
-                )
+            if save_dir and epoch % save_every == 0:
+                # 添加barrier确保所有rank同步
+                if self.ddp_enabled:
+                    import torch.distributed as dist
+                    dist.barrier()
+                if self.rank == 0:
+                    self.save_checkpoint(
+                        os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pt'),
+                        epoch, train_metrics['loss']
+                    )
+                if self.ddp_enabled:
+                    dist.barrier()
             
             # 定期可视化（只在 rank 0 保存）
-            if visualize and VISUALIZATION_AVAILABLE and save_dir and epoch % plot_every == 0 and self.rank == 0:
-                try:
-                    plot_path = os.path.join(save_dir, f'training_curves_epoch_{epoch}.png')
-                    plot_training_curves(
-                        self.train_losses,
-                        self.val_losses if self.val_loader is not None else None,
-                        save_path=plot_path
-                    )
-                except Exception as e:
-                    if self.rank == 0:
+            if visualize and VISUALIZATION_AVAILABLE and save_dir and epoch % plot_every == 0:
+                # 添加barrier确保所有rank同步
+                if self.ddp_enabled:
+                    import torch.distributed as dist
+                    dist.barrier()
+                if self.rank == 0:
+                    try:
+                        plot_path = os.path.join(save_dir, f'training_curves_epoch_{epoch}.png')
+                        plot_training_curves(
+                            self.train_losses,
+                            self.val_losses if self.val_loader is not None else None,
+                            save_path=plot_path
+                        )
+                    except Exception as e:
                         print(f"Warning: Failed to plot training curves: {e}")
-            elif visualize and not VISUALIZATION_AVAILABLE and self.rank == 0:
-                if epoch == 1:
-                    print("   ⚠️  可视化已请求但 matplotlib 未安装，跳过绘图")
+                if self.ddp_enabled:
+                    dist.barrier()
+            elif visualize and not VISUALIZATION_AVAILABLE:
+                if self.ddp_enabled:
+                    import torch.distributed as dist
+                    dist.barrier()
+                if self.rank == 0:
+                    if epoch == 1:
+                        print("   ⚠️  可视化已请求但 matplotlib 未安装，跳过绘图")
+                if self.ddp_enabled:
+                    dist.barrier()
         
         # 训练结束后生成最终可视化（只在 rank 0 保存）
-        if visualize and VISUALIZATION_AVAILABLE and save_dir and self.rank == 0:
-            try:
-                final_plot_path = os.path.join(save_dir, 'training_curves_final.png')
-                plot_training_curves(
-                    self.train_losses,
-                    self.val_losses if self.val_loader is not None else None,
-                    save_path=final_plot_path
-                )
-                # 同时生成简化的对比图
-                simple_plot_path = os.path.join(save_dir, 'loss_comparison.png')
-                plot_loss_comparison(
-                    self.train_losses,
-                    self.val_losses if self.val_loader is not None else None,
-                    save_path=simple_plot_path
-                )
-            except Exception as e:
+        if visualize and VISUALIZATION_AVAILABLE and save_dir:
+            # 添加barrier确保所有rank同步
+            if self.ddp_enabled:
+                import torch.distributed as dist
+                dist.barrier()
                 if self.rank == 0:
-                    print(f"Warning: Failed to plot final training curves: {e}")
+                    try:
+                        final_plot_path = os.path.join(save_dir, 'training_curves_final.png')
+                        plot_training_curves(
+                            self.train_losses,
+                            self.val_losses if self.val_loader is not None else None,
+                            save_path=final_plot_path
+                        )
+                        # 同时生成简化的对比图
+                        simple_plot_path = os.path.join(save_dir, 'loss_comparison.png')
+                        plot_loss_comparison(
+                            self.train_losses,
+                            self.val_losses if self.val_loader is not None else None,
+                            save_path=simple_plot_path
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to plot final training curves: {e}")
+                if self.ddp_enabled:
+                    dist.barrier()
         
         if self.rank == 0:
             print("\n" + "=" * 60)
@@ -700,14 +787,107 @@ class Trainer:
                 )
             self.cosine_scheduler.step()
     
-    def load_checkpoint(self, path: str):
-        """加载检查点"""
+    def load_checkpoint(self, path: str) -> int:
+        """
+        加载检查点并恢复训练状态
+        
+        Args:
+            path: 检查点文件路径
+        
+        Returns:
+            下一个epoch编号（从checkpoint的epoch+1开始）
+        """
         checkpoint = torch.load(path, map_location=self.device)
-        self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
-        self.decoder.load_state_dict(checkpoint['decoder_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if 'scheduler_state_dict' in checkpoint:
+        
+        # 加载模型权重
+        encoder_state_dict = checkpoint['encoder_state_dict']
+        decoder_state_dict = checkpoint['decoder_state_dict']
+        
+        # 处理DDP模型的state_dict键名匹配
+        # 保存时已经去掉了module.前缀，所以需要根据当前模型状态添加或保持
+        def adjust_state_dict_keys(state_dict, is_ddp):
+            """调整state_dict的键名以匹配当前模型结构"""
+            if not state_dict:
+                return state_dict
+            
+            # 检查第一个键是否有module.前缀
+            first_key = next(iter(state_dict.keys()))
+            has_module_prefix = first_key.startswith('module.')
+            
+            if is_ddp and not has_module_prefix:
+                # 当前是DDP，但checkpoint没有module.前缀，需要添加
+                return {'module.' + k: v for k, v in state_dict.items()}
+            elif not is_ddp and has_module_prefix:
+                # 当前不是DDP，但checkpoint有module.前缀，需要去掉
+                return {k.replace('module.', ''): v for k, v in state_dict.items()}
+            else:
+                # 匹配，直接返回
+                return state_dict
+        
+        encoder_state_dict = adjust_state_dict_keys(encoder_state_dict, self.is_ddp_encoder)
+        decoder_state_dict = adjust_state_dict_keys(decoder_state_dict, self.is_ddp_decoder)
+        
+        # 使用strict=False允许部分加载（如果架构有变化）
+        self.encoder.load_state_dict(encoder_state_dict, strict=False)
+        self.decoder.load_state_dict(decoder_state_dict, strict=False)
+        
+        # 加载优化器状态
+        if 'optimizer_state_dict' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # 加载学习率调度器状态
+        if 'cosine_scheduler_state_dict' in checkpoint and hasattr(self, 'cosine_scheduler'):
+            self.cosine_scheduler.load_state_dict(checkpoint['cosine_scheduler_state_dict'])
+        elif 'scheduler_state_dict' in checkpoint:
             # 兼容旧的检查点格式
             if hasattr(self, 'scheduler'):
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        return checkpoint['epoch']
+        
+        # 恢复训练历史（用于继续绘制曲线）
+        if 'train_losses' in checkpoint:
+            self.train_losses = checkpoint['train_losses']
+        if 'val_losses' in checkpoint:
+            self.val_losses = checkpoint['val_losses']
+        
+        # 恢复最佳验证损失
+        # 注意：checkpoint['loss']是训练损失，不是验证损失
+        # 应该从val_losses历史中找到最佳验证损失
+        if 'val_losses' in checkpoint and checkpoint['val_losses']:
+            val_losses = checkpoint['val_losses']
+            # 提取所有有效的验证损失值
+            val_loss_values = []
+            for v in val_losses:
+                if v:  # 跳过空字典
+                    if isinstance(v, dict):
+                        val_loss_values.append(v.get('loss', float('inf')))
+                    else:
+                        val_loss_values.append(v)
+            # 找到最佳验证损失
+            if val_loss_values:
+                self.best_val_loss = min(val_loss_values)
+                if self.rank == 0:
+                    print(f"   从历史中恢复最佳验证损失: {self.best_val_loss:.4f}")
+            else:
+                # 如果没有有效的验证损失，使用checkpoint中的loss（可能是训练损失）
+                if 'loss' in checkpoint:
+                    self.best_val_loss = checkpoint['loss']
+                    if self.rank == 0:
+                        print(f"   ⚠️  警告: 使用checkpoint中的loss作为best_val_loss: {self.best_val_loss:.4f}")
+        elif 'loss' in checkpoint:
+            # 如果没有验证损失历史，使用checkpoint中的loss
+            self.best_val_loss = checkpoint['loss']
+            if self.rank == 0:
+                print(f"   ⚠️  警告: 没有验证损失历史，使用checkpoint中的loss: {self.best_val_loss:.4f}")
+        
+        # 恢复训练参数（如果存在）
+        if 'warmup_epochs' in checkpoint:
+            self.warmup_epochs = checkpoint['warmup_epochs']
+        if 'total_epochs' in checkpoint:
+            # 注意：这里不覆盖，因为用户可能想训练更多epochs
+            pass
+        if 'max_lr' in checkpoint:
+            self.max_lr = checkpoint['max_lr']
+        
+        # 返回下一个epoch编号
+        current_epoch = checkpoint.get('epoch', 0)
+        return current_epoch + 1

@@ -130,6 +130,12 @@ def main():
                        help="禁用训练可视化")
     parser.add_argument("--plot_every", type=int, default=5,
                        help="每 N 个 epoch 绘制一次图表（默认 5）")
+    parser.add_argument("--resume", type=str, default=None,
+                       help="从检查点恢复训练（提供checkpoint路径，如 checkpoints/best_model.pt）")
+    parser.add_argument("--early_stopping_patience", type=int, default=None,
+                       help="早停耐心值，验证损失连续N轮不下降则停止训练（None表示禁用）")
+    parser.add_argument("--early_stopping_min_delta", type=float, default=0.0,
+                       help="早停最小改进阈值，只有改进超过此值才认为是有效改进")
     
     # DDP 参数
     parser.add_argument("--ddp", action="store_true",
@@ -156,7 +162,14 @@ def main():
     
     if ddp_enabled and local_rank >= 0:
         # 使用环境变量初始化（torchrun 模式）
-        dist.init_process_group(backend="nccl")
+        # 设置NCCL超时时间（默认600秒，增加到1800秒以应对长时间训练）
+        os.environ.setdefault('NCCL_TIMEOUT', '1800')
+        # 创建超时对象（30分钟）
+        timeout = torch.distributed.default_pg_timeout if hasattr(torch.distributed, 'default_pg_timeout') else None
+        if timeout is None:
+            from datetime import timedelta
+            timeout = timedelta(seconds=1800)  # 30分钟
+        dist.init_process_group(backend="nccl", timeout=timeout)
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
         rank = rank if rank >= 0 else local_rank
@@ -400,7 +413,10 @@ def main():
         save_every=10,
         train_sampler=train_sampler if ddp_enabled else None,
         visualize=args.visualize,
-        plot_every=args.plot_every
+        plot_every=args.plot_every,
+        resume_from=args.resume,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta
     )
     
     if rank == 0:
