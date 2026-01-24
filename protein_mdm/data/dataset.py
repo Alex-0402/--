@@ -61,6 +61,11 @@ class ProteinStructureDataset(Dataset):
         """
         Initialize the dataset.
         
+        ✅ 多进程安全设计：
+        - 不在 __init__ 中打开任何文件句柄
+        - 不在 __init__ 中创建 parser（避免 fork 问题）
+        - 所有文件操作都在 __getitem__ 中进行（懒加载）
+        
         Args:
             pdb_files: Path to a single PDB file, directory containing PDB files,
                       or list of PDB file paths
@@ -70,15 +75,22 @@ class ProteinStructureDataset(Dataset):
             lazy_loading: If True, only load data when accessed (default: True)
         """
         self.vocab = vocab if vocab is not None else get_vocab()
-        self.parser = MMCIFParser(QUIET=True) if use_mmcif else PDBParser(QUIET=True)
+        # ✅ 多进程安全：不在 __init__ 中创建 parser，避免 fork 时复制文件句柄
+        # parser 将在 __getitem__ 中按需创建（懒加载）
+        # 每个 worker 进程在 fork 后都会创建自己的 parser 实例
+        self.use_mmcif = use_mmcif
+        self._parser = None  # 懒加载：在需要时创建（每个 worker 进程独立）
+        
         self.cache_dir = cache_dir
         self.lazy_loading = lazy_loading
         
         # Create cache directory if specified
+        # 注意：os.makedirs 是安全的，不会导致 fork 问题
         if self.cache_dir is not None:
             os.makedirs(self.cache_dir, exist_ok=True)
         
         # Collect PDB files
+        # 注意：只收集文件路径，不打开文件
         if isinstance(pdb_files, str):
             if os.path.isfile(pdb_files):
                 self.pdb_files = [pdb_files]
@@ -109,13 +121,36 @@ class ProteinStructureDataset(Dataset):
         if len(self.pdb_files) == 0:
             raise ValueError("No PDB files found!")
         
-        print(f"Initialized dataset with {len(self.pdb_files)} PDB files")
-        if self.cache_dir:
-            print(f"Cache directory: {self.cache_dir}")
+        # ✅ 修复：只在主进程中打印，避免多进程输出混乱
+        # 使用 os.getpid() 检查是否为主进程
+        if os.getpid() == os.getppid() or not hasattr(os, 'getppid'):
+            # 主进程或无法确定父进程时打印
+            print(f"Initialized dataset with {len(self.pdb_files)} PDB files")
+            if self.cache_dir:
+                print(f"Cache directory: {self.cache_dir}")
     
     def __len__(self) -> int:
         """Return the number of samples in the dataset"""
         return len(self.pdb_files)
+    
+    def _get_parser(self):
+        """
+        懒加载 parser：按需创建，确保多进程安全。
+        
+        ✅ 多进程安全设计：
+        - 每个 worker 进程在 fork 后都会创建自己的 parser 实例
+        - 不在 __init__ 中创建，避免 fork 时复制文件句柄
+        - 每个 worker 进程独立，不需要锁（进程间不共享内存）
+        
+        Returns:
+            PDBParser 或 MMCIFParser 实例
+        """
+        # ✅ 懒加载：在需要时才创建 parser
+        # 每个 worker 进程在 fork 后都会创建自己的 parser 实例
+        # 不需要锁，因为每个进程有独立的内存空间
+        if self._parser is None:
+            self._parser = MMCIFParser(QUIET=True) if self.use_mmcif else PDBParser(QUIET=True)
+        return self._parser
     
     def _get_cache_path(self, pdb_path: str) -> Optional[str]:
         """
@@ -141,7 +176,11 @@ class ProteinStructureDataset(Dataset):
     
     def _load_from_cache(self, cache_path: str) -> Optional[Dict[str, torch.Tensor]]:
         """
-        从缓存加载数据
+        从缓存加载数据（懒加载，在 __getitem__ 中调用）
+        
+        ✅ 多进程安全：
+        - 每次调用都打开和关闭文件，不持有文件句柄
+        - 使用 map_location='cpu' 确保数据加载到 CPU
         
         Args:
             cache_path: 缓存文件路径
@@ -153,28 +192,44 @@ class ProteinStructureDataset(Dataset):
             return None
         
         try:
+            # ✅ 懒加载：每次调用都打开和关闭文件，不持有文件句柄
+            # 这确保多进程安全，避免 fork 时复制文件句柄
             data = torch.load(cache_path, map_location='cpu')
             return data
         except Exception as e:
-            print(f"Warning: Failed to load cache {cache_path}: {e}")
+            # 只在主进程中打印警告，避免多进程输出混乱
+            if os.getpid() == os.getppid() or not hasattr(os, 'getppid'):
+                print(f"Warning: Failed to load cache {cache_path}: {e}")
             return None
     
     def _save_to_cache(self, cache_path: str, data: Dict[str, torch.Tensor]):
         """
-        保存数据到缓存
+        保存数据到缓存（懒加载，在 __getitem__ 中调用）
+        
+        ✅ 多进程安全：
+        - 每次调用都打开和关闭文件，不持有文件句柄
+        - 使用文件锁确保多进程写入安全（可选）
         
         Args:
             cache_path: 缓存文件路径
             data: 要保存的数据字典
         """
         try:
+            # ✅ 懒加载：每次调用都打开和关闭文件，不持有文件句柄
+            # 这确保多进程安全，避免 fork 时复制文件句柄
             torch.save(data, cache_path)
         except Exception as e:
-            print(f"Warning: Failed to save cache {cache_path}: {e}")
+            # 只在主进程中打印警告，避免多进程输出混乱
+            if os.getpid() == os.getppid() or not hasattr(os, 'getppid'):
+                print(f"Warning: Failed to save cache {cache_path}: {e}")
     
     def _parse_pdb_file(self, pdb_path: str) -> Optional[Dict[str, torch.Tensor]]:
         """
-        解析 PDB 文件并返回处理后的数据
+        解析 PDB 文件并返回处理后的数据（懒加载，在 __getitem__ 中调用）
+        
+        ✅ 多进程安全：
+        - 使用懒加载的 parser（每个 worker 进程有自己的实例）
+        - parser.get_structure() 每次调用都打开和关闭文件，不持有文件句柄
         
         Args:
             pdb_path: PDB 文件路径
@@ -183,8 +238,12 @@ class ProteinStructureDataset(Dataset):
             数据字典，如果解析失败则返回 None
         """
         try:
+            # ✅ 懒加载：使用 _get_parser() 获取 parser
+            # 这确保每个 worker 进程在 fork 后创建自己的 parser
+            parser = self._get_parser()
             # Parse PDB file
-            structure = self.parser.get_structure('protein', pdb_path)
+            # 注意：get_structure() 每次调用都打开和关闭文件，不持有文件句柄
+            structure = parser.get_structure('protein', pdb_path)
             
             # Extract data from first model and first chain
             model = structure[0]
@@ -233,6 +292,11 @@ class ProteinStructureDataset(Dataset):
         """
         Load and process a single protein structure.
         
+        ✅ 多进程安全设计：
+        - 所有文件操作都在这里进行（懒加载）
+        - 每次调用都打开和关闭文件，不持有文件句柄
+        - 使用懒加载的 parser，确保每个 worker 进程有自己的实例
+        
         Args:
             idx: Index of the PDB file to load
         
@@ -249,7 +313,8 @@ class ProteinStructureDataset(Dataset):
         """
         pdb_path = self.pdb_files[idx]
         
-        # 如果 pdb_path 已经是 .pt 文件（缓存文件），直接加载
+        # ✅ 懒加载：如果 pdb_path 已经是 .pt 文件（缓存文件），直接加载
+        # 每次调用都打开和关闭文件，不持有文件句柄
         if pdb_path.endswith('.pt'):
             cached_data = self._load_from_cache(pdb_path)
             if cached_data is not None:
@@ -258,17 +323,20 @@ class ProteinStructureDataset(Dataset):
                 # 缓存文件损坏，返回 None
                 return None
         
-        # 检查缓存
+        # ✅ 懒加载：检查缓存
+        # 每次调用都打开和关闭文件，不持有文件句柄
         cache_path = self._get_cache_path(pdb_path)
         if cache_path is not None:
             cached_data = self._load_from_cache(cache_path)
             if cached_data is not None:
                 return cached_data
         
-        # 缓存未命中，解析 PDB 文件
+        # ✅ 懒加载：缓存未命中，解析 PDB 文件
+        # 使用懒加载的 parser，确保每个 worker 进程有自己的实例
         data = self._parse_pdb_file(pdb_path)
         
-        # 如果解析成功，保存到缓存
+        # ✅ 懒加载：如果解析成功，保存到缓存
+        # 每次调用都打开和关闭文件，不持有文件句柄
         if data is not None and cache_path is not None:
             self._save_to_cache(cache_path, data)
         

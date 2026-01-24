@@ -12,6 +12,11 @@ import sys
 import os
 from pathlib import Path
 
+import matplotlib
+# 【关键】强制使用无窗口后端，防止 Rank 0 试图弹窗而卡死
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+
 # 添加项目根目录到 Python 路径，以支持相对导入
 project_root = Path(__file__).parent
 if str(project_root) not in sys.path:
@@ -287,9 +292,10 @@ def main():
             batch_size=args.batch_size,
             sampler=train_sampler,
             collate_fn=collate_fn,
-            num_workers=0,  # 改为0避免DDP死锁
+            num_workers=4,  # ✅ 多进程安全：Dataset 已重构为懒加载模式
             pin_memory=True,
-            persistent_workers=False
+            persistent_workers=False,  # ✅ 修复：persistent_workers=True 在 epoch 切换时可能导致死锁
+            drop_last=True  # ✅ 修复：防止最后一个batch大小不一致导致DDP同步错位
         )
         
         val_loader = None
@@ -305,9 +311,10 @@ def main():
                 batch_size=args.batch_size,
                 sampler=val_sampler,
                 collate_fn=collate_fn,
-                num_workers=0,  # 改为0避免DDP死锁
+                num_workers=4,  # ✅ 多进程安全：Dataset 已重构为懒加载模式
                 pin_memory=True,
-                persistent_workers=False
+                persistent_workers=False,  # ✅ 修复：persistent_workers=True 在 epoch 切换时可能导致死锁
+                drop_last=True  # ✅ 修复：防止最后一个batch大小不一致导致DDP同步错位
             )
     else:
         # 单GPU模式：使用普通DataLoader
@@ -316,7 +323,10 @@ def main():
             batch_size=args.batch_size,
             shuffle=True,
             collate_fn=collate_fn,
-            num_workers=0
+            num_workers=4,  # ✅ 多进程安全：Dataset 已重构为懒加载模式
+            pin_memory=True,
+            persistent_workers=False,  # ✅ 修复：persistent_workers=True 在 epoch 切换时可能导致死锁
+            drop_last=True  # ✅ 修复：保持一致性
         )
         
         val_loader = None
@@ -326,7 +336,10 @@ def main():
                 batch_size=args.batch_size,
                 shuffle=False,
                 collate_fn=collate_fn,
-                num_workers=0
+                num_workers=4,  # ✅ 多进程安全：Dataset 已重构为懒加载模式
+                pin_memory=True,
+                persistent_workers=False,  # ✅ 修复：persistent_workers=True 在 epoch 切换时可能导致死锁
+                drop_last=True  # ✅ 修复：保持一致性
             )
     
     # 初始化模型

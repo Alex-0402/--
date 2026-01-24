@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 from typing import Optional, Dict
 import os
 import numpy as np
-from tqdm import tqdm
+# ✅ 修复：移除 tqdm，避免 I/O 阻塞导致死锁
+# from tqdm import tqdm
 
 from models.encoder import BackboneEncoder
 from models.decoder import FragmentDecoder
@@ -290,17 +291,26 @@ class Trainer:
         # 在创建迭代器前再次同步（关键：确保所有进程都准备好）
         if self.ddp_enabled:
             import torch.distributed as dist
+            import sys
+            sys.stdout.flush()  # 确保所有输出都刷新
             print(f"[Rank {self.rank}] 准备进入创建迭代器前的 barrier...", flush=True)
             dist.barrier()
             print(f"[Rank {self.rank}] 创建迭代器前的 barrier 通过", flush=True)
             if self.rank == 0:
                 print(f"[Rank 0] 开始创建数据加载器迭代器...", flush=True)
         
+        # ✅ 修复：确保所有进程在创建迭代器前完全同步
         # 关键修复：每次 epoch 都重新创建迭代器
         # 注意：DataLoader 的迭代器在每次 epoch 都需要重新创建
         # 所有进程都先创建迭代器
         try:
+            # ✅ 修复：在创建迭代器前，确保所有输出都刷新
+            import sys
+            sys.stdout.flush()
             print(f"[Rank {self.rank}] 正在创建迭代器...", flush=True)
+            # ✅ 修复：使用 try-except 捕获可能的阻塞
+            # 如果 persistent_workers=False，每次创建迭代器都会重新启动 worker 进程
+            # 这可能导致某些进程延迟
             data_iter = iter(self.train_loader)
             print(f"[Rank {self.rank}] 迭代器创建成功", flush=True)
         except Exception as e:
@@ -320,20 +330,9 @@ class Trainer:
             if self.rank == 0:
                 print(f"[Rank 0] 迭代器创建完成，所有进程已同步", flush=True)
         
-        # 现在创建 tqdm（只在 rank 0，不阻塞其他进程）
-        # 注意：tqdm 创建不应该阻塞其他进程
-        print(f"[Rank {self.rank}] 准备创建 tqdm（如果需要）...", flush=True)
-        if self.rank == 0:
-            total_batches = len(self.train_loader)
-            pbar = tqdm(total=total_batches, desc="Training", initial=0)
-            print(f"[Rank 0] tqdm 进度条创建完成", flush=True)
-        else:
-            pbar = None
-            print(f"[Rank {self.rank}] 跳过 tqdm（非 rank 0）", flush=True)
-        
         # 在开始迭代前，最后一次同步（确保所有进程都准备好）
-        # 这是关键：确保所有进程都创建了迭代器和 tqdm（如果需要）
-        # 注意：这个 barrier 可能会卡住，如果某些进程没有到达这里
+        # 这是关键：确保所有进程都创建了迭代器
+        # 注意：tqdm 创建移到 barrier 之后，避免 rank 0 延迟导致死锁
         if self.ddp_enabled:
             import torch.distributed as dist
             # 确保所有打印都完成（flush）
@@ -357,11 +356,10 @@ class Trainer:
                 print(f"[Rank {self.rank}] ⚠️  barrier 失败: {e}", flush=True)
                 raise
         
-        # 现在开始迭代
+        # ✅ 修复：移除 tqdm，避免 I/O 阻塞导致死锁
+        # 现在开始迭代（使用普通的 for 循环）
         batch_idx = 0
         total_batches_expected = len(self.train_loader)
-        # 所有进程都打印，但使用 flush 确保输出及时
-        # 注意：这个打印应该在 barrier 之后，所以如果看到这个打印，说明已经通过了 barrier
         print(f"[Rank {self.rank}] 预期处理 {total_batches_expected} 个批次（barrier 已通过）", flush=True)
         
         try:
@@ -441,23 +439,21 @@ class Trainer:
                 total_structure_loss += losses.get('structure_loss', torch.tensor(0.0)).item()
                 num_batches += 1
                 
-                # 更新进度条（只在 rank 0）
+                # ✅ 修复：移除 tqdm，改用简单的 logging
+                # 仅在 rank 0 且每 10 个 batch 打印一次，避免 I/O 阻塞
                 batch_idx += 1
-                if pbar is not None:
+                if self.rank == 0 and batch_idx % 10 == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'loss': f"{losses['total_loss'].item():.4f}",
-                        'frag': f"{losses['fragment_loss'].item():.4f}",
-                        'tors': f"{losses['torsion_loss'].item():.4f}",
-                        'struct': f"{losses.get('structure_loss', torch.tensor(0.0)).item():.4f}",
-                        'mask_ratio': f"{current_mask_ratio:.3f}",
-                        'lr': f"{current_lr:.2e}"
-                    })
-                
-                # 在最后一个批次时添加调试信息
-                if batch_idx == len(self.train_loader) and self.rank == 0:
-                    print(f"[Rank 0] 处理最后一个批次 ({batch_idx}/{len(self.train_loader)})...")
+                    print(
+                        f"[Rank 0] Batch {batch_idx}/{total_batches_expected} | "
+                        f"loss={losses['total_loss'].item():.4f} | "
+                        f"frag={losses['fragment_loss'].item():.4f} | "
+                        f"tors={losses['torsion_loss'].item():.4f} | "
+                        f"struct={losses.get('structure_loss', torch.tensor(0.0)).item():.4f} | "
+                        f"mask_ratio={current_mask_ratio:.3f} | "
+                        f"lr={current_lr:.2e}",
+                        flush=True
+                    )
                 
                 # 注意：不要在循环内部添加 barrier，因为不同进程的批次数量可能不同
                 # DistributedSampler 可能导致某些进程的批次数量略有不同
@@ -476,21 +472,10 @@ class Trainer:
                     pass
             raise  # 重新抛出异常
         
-        # 在关闭进度条前添加调试信息
-        print(f"[Rank {self.rank}] 训练循环结束，batch_idx={batch_idx}, 预期={total_batches_expected}")
-        
-        # 关闭进度条（可能导致卡住，添加超时保护）
-        if pbar is not None:
-            try:
-                if self.rank == 0:
-                    print(f"[Rank 0] 准备关闭进度条...")
-                pbar.close()
-                if self.rank == 0:
-                    print(f"[Rank 0] 进度条已关闭")
-            except Exception as e:
-                print(f"[Rank {self.rank}] ⚠️  警告: 关闭进度条时出错: {e}")
-        
-        print(f"[Rank {self.rank}] 训练迭代完成，处理了 {batch_idx} 个批次（预期 {total_batches_expected} 个）")
+        # ✅ 修复：移除 tqdm，不再需要关闭进度条
+        # 打印训练完成信息
+        print(f"[Rank {self.rank}] 训练循环结束，batch_idx={batch_idx}, 预期={total_batches_expected}", flush=True)
+        print(f"[Rank {self.rank}] 训练迭代完成，处理了 {batch_idx} 个批次（预期 {total_batches_expected} 个）", flush=True)
         if self.rank == 0:
             print(f"[Rank 0] 准备同步所有进程...")
         
@@ -564,8 +549,16 @@ class Trainer:
         num_batches = 0
         
         with torch.no_grad():
-            # 只在 rank 0 显示进度条，其他 rank 禁用
-            for batch in tqdm(self.val_loader, desc="Validation", disable=(self.rank != 0)):
+            # ✅ 修复：移除 tqdm，使用普通的 for 循环
+            # 只在 rank 0 打印进度信息
+            val_batch_idx = 0
+            total_val_batches = len(self.val_loader)
+            if self.rank == 0:
+                print(f"[Rank 0] 开始验证，共 {total_val_batches} 个批次", flush=True)
+            for batch in self.val_loader:
+                val_batch_idx += 1
+                if self.rank == 0 and val_batch_idx % 5 == 0:
+                    print(f"[Rank 0] 验证进度: {val_batch_idx}/{total_val_batches}", flush=True)
                 backbone_coords = batch['backbone_coords'].to(self.device)
                 fragment_token_ids = batch['fragment_token_ids'].to(self.device)
                 torsion_bins = batch['torsion_bins'].to(self.device)
@@ -745,7 +738,25 @@ class Trainer:
                 print(f"恢复训练: 从 epoch {start_epoch} 继续，目标 {num_epochs} epochs")
         
         for epoch in range(start_epoch, num_epochs + 1):
+            # ✅ 修复：强制清理内存和显存，防止内存泄漏
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             self.current_epoch = epoch
+            
+            # ✅ 修复：在 epoch 切换时，确保所有进程都完全同步
+            # 这确保 DataLoader 的 worker 进程（如果 persistent_workers=False）完全关闭
+            if self.ddp_enabled:
+                import torch.distributed as dist
+                import sys
+                sys.stdout.flush()
+                if self.rank == 0:
+                    print(f"[Rank 0] Epoch {epoch} 开始前，同步所有进程...", flush=True)
+                dist.barrier()
+                if self.rank == 0:
+                    print(f"[Rank 0] Epoch {epoch} 开始前，所有进程已同步", flush=True)
             
             # DDP 模式下，确保所有进程在 epoch 开始前同步
             if self.ddp_enabled:
