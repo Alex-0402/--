@@ -15,7 +15,7 @@ Date: 2024
 
 import numpy as np
 from typing import Tuple, List, Optional
-from Bio.PDB.vectors import Vector, calc_dihedral
+# 已移除 Bio.PDB 依赖，改用纯 NumPy 向量化实现
 
 
 def calculate_dihedrals(
@@ -27,6 +27,8 @@ def calculate_dihedrals(
     
     A dihedral angle is defined by four atoms: A-B-C-D, where the angle
     measures the rotation around the B-C bond as viewed along that bond.
+    
+    This function uses fully vectorized NumPy operations for high performance.
     
     Args:
         coords: Atomic coordinates array of shape [N, 3] where N is the number of atoms
@@ -45,20 +47,50 @@ def calculate_dihedrals(
     if len(atom_indices) == 0:
         return np.array([])
     
-    angles = []
-    for i, j, k, l in atom_indices:
-        # Extract coordinates for the four atoms
-        p1 = Vector(coords[i])
-        p2 = Vector(coords[j])
-        p3 = Vector(coords[k])
-        p4 = Vector(coords[l])
-        
-        # Calculate dihedral angle using BioPython's calc_dihedral
-        # This function returns angle in radians, range [-pi, pi]
-        angle = calc_dihedral(p1, p2, p3, p4)
-        angles.append(angle)
+    # 将 atom_indices 转换为 NumPy 数组以便向量化操作
+    indices = np.array(atom_indices)  # [M, 4]
+    M = len(atom_indices)
     
-    return np.array(angles)
+    # 一次性提取所有四个原子的坐标
+    # p0: [M, 3], p1: [M, 3], p2: [M, 3], p3: [M, 3]
+    p0 = coords[indices[:, 0]]  # A
+    p1 = coords[indices[:, 1]]  # B
+    p2 = coords[indices[:, 2]]  # C
+    p3 = coords[indices[:, 3]]  # D
+    
+    # 计算向量
+    # b0 = p1 - p0: [M, 3]
+    # b1 = p2 - p1: [M, 3]
+    # b2 = p3 - p2: [M, 3]
+    b0 = p1 - p0
+    b1 = p2 - p1
+    b2 = p3 - p2
+    
+    # 计算法向量
+    # n0 = b0 × b1: [M, 3]
+    # n1 = b1 × b2: [M, 3]
+    n0 = np.cross(b0, b1)  # [M, 3]
+    n1 = np.cross(b1, b2)  # [M, 3]
+    
+    # 归一化 b1（用于计算投影）
+    b1_norm = np.linalg.norm(b1, axis=1, keepdims=True)  # [M, 1]
+    # 避免除零错误
+    b1_norm = np.where(b1_norm < 1e-10, 1.0, b1_norm)
+    b1_unit = b1 / b1_norm  # [M, 3]
+    
+    # 计算 n0 和 n1 的叉积（用于确定符号）
+    m = np.cross(n0, b1_unit)  # [M, 3]
+    
+    # 计算点积
+    # x = n0 · n1: [M]
+    # y = m · n1: [M]
+    x = np.sum(n0 * n1, axis=1)  # [M]
+    y = np.sum(m * n1, axis=1)   # [M]
+    
+    # 使用 arctan2 计算角度，范围 [-pi, pi]
+    angles = np.arctan2(y, x)  # [M]
+    
+    return angles
 
 
 def calculate_dihedral_from_coords(
@@ -80,11 +112,10 @@ def calculate_dihedral_from_coords(
     Returns:
         Dihedral angle in radians, range [-pi, pi]
     """
-    v1 = Vector(p1)
-    v2 = Vector(p2)
-    v3 = Vector(p3)
-    v4 = Vector(p4)
-    return calc_dihedral(v1, v2, v3, v4)
+    # 使用向量化的 calculate_dihedrals 函数
+    coords = np.array([p1, p2, p3, p4])  # [4, 3]
+    angles = calculate_dihedrals(coords, [(0, 1, 2, 3)])
+    return float(angles[0])
 
 
 def discretize_angle(angle_rad: float, num_bins: int = 72) -> int:

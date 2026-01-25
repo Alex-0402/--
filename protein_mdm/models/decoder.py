@@ -184,6 +184,16 @@ class FragmentDecoder(nn.Module):
             nn.Linear(hidden_dim, num_torsion_bins)
         )
         
+        # Offset Head: 预测扭转角的微调偏移量（用于提升精度）
+        # 输出维度为 num_torsion_bins，每个 bin 预测一个 offset
+        self.offset_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_torsion_bins)
+        )
+        
         # 确保在 eval 模式下 Dropout 被禁用
         self._dropout_rate = dropout
         
@@ -247,7 +257,7 @@ class FragmentDecoder(nn.Module):
         target_fragments: torch.Tensor,
         fragment_mask: Optional[torch.Tensor] = None,
         sequence_lengths: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         前向传播
         
@@ -263,6 +273,7 @@ class FragmentDecoder(nn.Module):
             Tuple of:
             - fragment_logits: [batch_size, M, vocab_size] - 片段类型预测
             - torsion_logits: [batch_size, M, num_torsion_bins] - 扭转角预测
+            - offset_logits: [batch_size, M, num_torsion_bins] - 扭转角偏移量预测
         """
         batch_size, seq_len, _ = node_embeddings.shape
         frag_seq_len = target_fragments.shape[1] if target_fragments.dim() > 1 else 1
@@ -336,6 +347,7 @@ class FragmentDecoder(nn.Module):
         try:
             fragment_logits = self.type_head(decoder_output)  # [batch_size, M, vocab_size]
             torsion_logits = self.torsion_head(decoder_output)  # [batch_size, M, num_torsion_bins]
+            offset_logits = self.offset_head(decoder_output)  # [batch_size, M, num_torsion_bins]
             
             # 检查预测输出是否有 NaN，如果有则替换为 0
             if torch.isnan(fragment_logits).any() or torch.isinf(fragment_logits).any():
@@ -350,13 +362,20 @@ class FragmentDecoder(nn.Module):
                     torch.zeros_like(torsion_logits),
                     torsion_logits
                 )
+            if torch.isnan(offset_logits).any() or torch.isinf(offset_logits).any():
+                offset_logits = torch.where(
+                    torch.isnan(offset_logits) | torch.isinf(offset_logits),
+                    torch.zeros_like(offset_logits),
+                    offset_logits
+                )
         except Exception as e:
             # 如果预测头失败，返回零输出
             print(f"  ⚠️  预测头失败: {e}")
             fragment_logits = torch.zeros(batch_size, frag_seq_len, self.vocab_size, device=device)
             torsion_logits = torch.zeros(batch_size, frag_seq_len, self.num_torsion_bins, device=device)
+            offset_logits = torch.zeros(batch_size, frag_seq_len, self.num_torsion_bins, device=device)
         
-        return fragment_logits, torsion_logits
+        return fragment_logits, torsion_logits, offset_logits
 
 
 # 测试代码
@@ -384,7 +403,7 @@ if __name__ == "__main__":
     target_fragments = torch.randint(0, vocab_size, (batch_size, frag_seq_len))
     
     # 前向传播
-    frag_logits, tors_logits = decoder(
+    frag_logits, tors_logits, offset_logits = decoder(
         node_embeddings=node_embeddings,
         target_fragments=target_fragments
     )
@@ -396,4 +415,5 @@ if __name__ == "__main__":
     print(f"目标片段形状: {target_fragments.shape}")
     print(f"Fragment logits 形状: {frag_logits.shape}")
     print(f"Torsion logits 形状: {tors_logits.shape}")
+    print(f"Offset logits 形状: {offset_logits.shape}")
     print("="*60)

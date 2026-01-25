@@ -30,6 +30,22 @@ from .geometry import calculate_dihedrals, discretize_angles
 warnings.simplefilter('ignore', PDBConstructionWarning)
 
 
+def random_rotation_matrix() -> torch.Tensor:
+    """
+    生成均匀分布的随机 3D 旋转矩阵。
+    
+    使用 QR 分解方法生成均匀分布在 SO(3) 群上的旋转矩阵。
+    
+    Returns:
+        形状为 [3, 3] 的旋转矩阵张量
+    """
+    x = torch.randn(3, 3)
+    q, r = torch.linalg.qr(x)
+    d = torch.diag(r).sign()
+    q *= d
+    return q
+
+
 class ProteinStructureDataset(Dataset):
     """
     Dataset for loading protein structures from PDB files.
@@ -288,6 +304,42 @@ class ProteinStructureDataset(Dataset):
             # 解析失败，返回 None
             return None
     
+    def _apply_data_augmentation(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        对蛋白质结构数据进行增强，防止过拟合。
+        
+        应用的操作：
+        1. 中心化：将 CA 原子中心平移到原点
+        2. 随机旋转：使用均匀分布的旋转矩阵
+        3. 高斯噪声：添加微小的随机噪声
+        
+        Args:
+            data: 包含 'backbone_coords' 的数据字典
+        
+        Returns:
+            增强后的数据字典
+        """
+        backbone_coords = data['backbone_coords']  # [L, 4, 3]
+        
+        # 1. 中心化 (Centering)：计算 CA 原子的中心，将整个蛋白质平移到原点
+        center = backbone_coords[:, 1, :].mean(dim=0, keepdim=True)  # CA 原子索引为 1
+        backbone_coords = backbone_coords - center.unsqueeze(1)
+        
+        # 2. 随机旋转 (Random Rotation)：使用生成的旋转矩阵对坐标进行旋转
+        rot_mat = random_rotation_matrix()
+        L, atoms, dims = backbone_coords.shape
+        coords_flat = backbone_coords.view(-1, 3)
+        coords_rotated = torch.matmul(coords_flat, rot_mat)
+        backbone_coords = coords_rotated.view(L, atoms, dims)
+        
+        # 3. 高斯噪声 (Gaussian Noise)：给坐标添加微小的随机噪声
+        noise = torch.randn_like(backbone_coords) * 0.02
+        backbone_coords = backbone_coords + noise
+        
+        # 更新增强后的坐标
+        data['backbone_coords'] = backbone_coords
+        return data
+    
     def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
         """
         Load and process a single protein structure.
@@ -318,7 +370,8 @@ class ProteinStructureDataset(Dataset):
         if pdb_path.endswith('.pt'):
             cached_data = self._load_from_cache(pdb_path)
             if cached_data is not None:
-                return cached_data
+                # 对缓存数据应用数据增强
+                return self._apply_data_augmentation(cached_data)
             else:
                 # 缓存文件损坏，返回 None
                 return None
@@ -329,7 +382,8 @@ class ProteinStructureDataset(Dataset):
         if cache_path is not None:
             cached_data = self._load_from_cache(cache_path)
             if cached_data is not None:
-                return cached_data
+                # 对缓存数据应用数据增强
+                return self._apply_data_augmentation(cached_data)
         
         # ✅ 懒加载：缓存未命中，解析 PDB 文件
         # 使用懒加载的 parser，确保每个 worker 进程有自己的实例
@@ -339,6 +393,10 @@ class ProteinStructureDataset(Dataset):
         # 每次调用都打开和关闭文件，不持有文件句柄
         if data is not None and cache_path is not None:
             self._save_to_cache(cache_path, data)
+        
+        # 数据增强：防止过拟合（对新解析的数据也应用增强）
+        if data is not None:
+            data = self._apply_data_augmentation(data)
         
         # 如果解析失败，返回 None（会被 collate_fn 过滤）
         return data
