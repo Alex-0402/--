@@ -72,7 +72,8 @@ class ProteinStructureDataset(Dataset):
         vocab: Optional[FragmentVocab] = None,
         use_mmcif: bool = False,
         cache_dir: Optional[str] = None,
-        lazy_loading: bool = True
+        lazy_loading: bool = True,
+        augment: bool = False
     ):
         """
         Initialize the dataset.
@@ -89,6 +90,8 @@ class ProteinStructureDataset(Dataset):
             use_mmcif: If True, use MMCIFParser instead of PDBParser
             cache_dir: Optional directory to cache processed data (if None, no caching)
             lazy_loading: If True, only load data when accessed (default: True)
+            augment: If True, apply data augmentation (random rotation and noise).
+                    Should be False for validation set to ensure stable metrics.
         """
         self.vocab = vocab if vocab is not None else get_vocab()
         # ✅ 多进程安全：不在 __init__ 中创建 parser，避免 fork 时复制文件句柄
@@ -99,6 +102,7 @@ class ProteinStructureDataset(Dataset):
         
         self.cache_dir = cache_dir
         self.lazy_loading = lazy_loading
+        self.augment = augment
         
         # Create cache directory if specified
         # 注意：os.makedirs 是安全的，不会导致 fork 问题
@@ -309,9 +313,9 @@ class ProteinStructureDataset(Dataset):
         对蛋白质结构数据进行增强，防止过拟合。
         
         应用的操作：
-        1. 中心化：将 CA 原子中心平移到原点
-        2. 随机旋转：使用均匀分布的旋转矩阵
-        3. 高斯噪声：添加微小的随机噪声
+        1. 中心化：将 CA 原子中心平移到原点（始终执行）
+        2. 随机旋转：使用均匀分布的旋转矩阵（仅在 augment=True 时执行）
+        3. 高斯噪声：添加微小的随机噪声（仅在 augment=True 时执行）
         
         Args:
             data: 包含 'backbone_coords' 的数据字典
@@ -322,21 +326,25 @@ class ProteinStructureDataset(Dataset):
         backbone_coords = data['backbone_coords']  # [L, 4, 3]
         
         # 1. 中心化 (Centering)：计算 CA 原子的中心，将整个蛋白质平移到原点
+        # 注意：中心化应该对所有数据都执行（无论是否增强），以确保数据一致性
         center = backbone_coords[:, 1, :].mean(dim=0, keepdim=True)  # CA 原子索引为 1
         backbone_coords = backbone_coords - center.unsqueeze(1)
         
-        # 2. 随机旋转 (Random Rotation)：使用生成的旋转矩阵对坐标进行旋转
-        rot_mat = random_rotation_matrix()
-        L, atoms, dims = backbone_coords.shape
-        coords_flat = backbone_coords.view(-1, 3)
-        coords_rotated = torch.matmul(coords_flat, rot_mat)
-        backbone_coords = coords_rotated.view(L, atoms, dims)
+        # 2. 随机旋转和高斯噪声：仅在 augment=True 时执行
+        if self.augment:
+            # 2.1 随机旋转 (Random Rotation)：使用生成的旋转矩阵对坐标进行旋转
+            rot_mat = random_rotation_matrix()
+            L, atoms, dims = backbone_coords.shape
+            coords_flat = backbone_coords.view(-1, 3)
+            coords_rotated = torch.matmul(coords_flat, rot_mat)
+            backbone_coords = coords_rotated.view(L, atoms, dims)
+            
+            # 2.2 高斯噪声 (Gaussian Noise)：给坐标添加微小的随机噪声
+            # 减小噪声强度以缓解过拟合，避免破坏原子间的长程依赖
+            noise = torch.randn_like(backbone_coords) * 0.01
+            backbone_coords = backbone_coords + noise
         
-        # 3. 高斯噪声 (Gaussian Noise)：给坐标添加微小的随机噪声
-        noise = torch.randn_like(backbone_coords) * 0.02
-        backbone_coords = backbone_coords + noise
-        
-        # 更新增强后的坐标
+        # 更新处理后的坐标
         data['backbone_coords'] = backbone_coords
         return data
     

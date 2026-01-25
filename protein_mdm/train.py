@@ -11,6 +11,7 @@ import argparse
 import sys
 import os
 from pathlib import Path
+from datetime import timedelta
 
 import matplotlib
 # 强制使用无窗口后端
@@ -22,14 +23,7 @@ project_root = Path(__file__).parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-import torch
-from torch.utils.data import DataLoader
-
-from models.encoder import BackboneEncoder
-from models.decoder import FragmentDecoder
-from data.dataset import ProteinStructureDataset, collate_fn
-from data.vocabulary import get_vocab
-from training.trainer import Trainer
+# 注意：torch 的导入将在 if __name__ == "__main__" 中，在设置 CUDA_VISIBLE_DEVICES 之后
 
 
 def load_train_val_splits(cache_dir: str):
@@ -73,7 +67,8 @@ def load_train_val_splits(cache_dir: str):
     return train_paths, val_paths
 
 
-def main():
+def parse_args():
+    """解析命令行参数"""
     parser = argparse.ArgumentParser(
         description="训练蛋白质侧链设计模型"
     )
@@ -99,6 +94,8 @@ def main():
                        help="Decoder 层数")
     parser.add_argument("--num_heads", type=int, default=8,
                        help="注意力头数")
+    parser.add_argument("--dropout", type=float, default=0.3,
+                       help="Dropout 率（默认 0.3，用于增强正则化）")
     
     # 训练参数
     parser.add_argument("--epochs", type=int, default=300,
@@ -107,8 +104,8 @@ def main():
                        help="学习率（最大学习率）")
     parser.add_argument("--warmup_epochs", type=int, default=20,
                        help="Warmup 轮数")
-    parser.add_argument("--weight_decay", type=float, default=1e-5,
-                       help="权重衰减")
+    parser.add_argument("--weight_decay", type=float, default=1e-3,
+                       help="权重衰减（默认 1e-3，用于增强正则化）")
     parser.add_argument("--masking_strategy", type=str, default="random",
                        choices=["random", "block"],
                        help="掩码策略")
@@ -128,30 +125,132 @@ def main():
                        help="每 N 个 epoch 绘制一次图表（默认 5）")
     parser.add_argument("--resume", type=str, default=None,
                        help="从检查点恢复训练（提供checkpoint路径，如 checkpoints/best_model.pt）")
-    parser.add_argument("--early_stopping_patience", type=int, default=None,
-                       help="早停耐心值，验证损失连续N轮不下降则停止训练（None表示禁用）")
+    parser.add_argument("--early_stopping_patience", type=int, default=50,
+                       help="早停耐心值，验证损失连续N轮不下降则停止训练（默认 50，给模型更多震荡收敛的时间）")
     parser.add_argument("--early_stopping_min_delta", type=float, default=0.0,
                        help="早停最小改进阈值，只有改进超过此值才认为是有效改进")
     
-    args = parser.parse_args()
+    # DDP 相关参数
+    parser.add_argument("--gpu_ids", type=str, default=None,
+                       help="指定使用的GPU ID（例如：'1,2,3,4,5,6,7'），在所有torch调用之前设置CUDA_VISIBLE_DEVICES")
+    parser.add_argument("--master_port", type=str, default="29500",
+                       help="DDP master port（默认：29500）")
+    parser.add_argument("--ddp", action="store_true",
+                       help="启用 DDP 模式（通常由 torchrun 自动检测，此参数用于手动模式）")
     
-    # 单GPU模式
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return parser.parse_args()
+
+
+def main():
+    # 关键：在 main 函数最开始解析参数并设置 CUDA_VISIBLE_DEVICES
+    # 这必须在任何 torch cuda 调用之前完成
+    args = globals().get('_args')
+    if args is None:
+        args = parse_args()
     
-    print("="*70)
-    print("蛋白质侧链设计模型 - 训练")
-    print("="*70)
-    print(f"设备: {device}")
-    print(f"PDB 路径: {args.pdb_path}")
-    print(f"批次大小: {args.batch_size}")
-    print(f"训练轮数: {args.epochs}")
-    print(f"扩散模型: 启用 (时间步数: {args.num_diffusion_steps})")
-    print(f"掩码比例: 动态 (Cosine Schedule, t=0时0%, t=1时100%)")
-    print(f"掩码策略: {args.masking_strategy}")
-    print("="*70)
+    # 在所有 torch cuda 调用之前设置 CUDA_VISIBLE_DEVICES
+    if args.gpu_ids:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
+        # 只在非 DDP 模式下打印，避免多进程重复打印
+        if "RANK" not in os.environ and "LOCAL_RANK" not in os.environ:
+            print(f"✅ 已设置 CUDA_VISIBLE_DEVICES={args.gpu_ids}")
+    
+    # 导入必要的模块（在设置 CUDA_VISIBLE_DEVICES 之后）
+    import torch
+    import torch.distributed as dist
+    from torch.utils.data import DataLoader
+    from torch.utils.data.distributed import DistributedSampler
+    
+    from models.encoder import BackboneEncoder
+    from models.decoder import FragmentDecoder
+    from data.dataset import ProteinStructureDataset, collate_fn
+    from data.vocabulary import get_vocab
+    from training.trainer import Trainer
+    
+    # 检查是否使用 DDP（通过环境变量判断，torchrun 会自动设置，或通过 --ddp 参数）
+    ddp_enabled = args.ddp or (
+        "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    ) or (
+        "LOCAL_RANK" in os.environ
+    )
+    
+    if ddp_enabled:
+        # 初始化 DDP
+        # 设置 NCCL 环境变量以调试和防止死锁
+        os.environ.setdefault("NCCL_TIMEOUT", "1800")  # 30分钟
+        os.environ["NCCL_P2P_DISABLE"] = "1"  # 禁用 P2P 防止 2080Ti 可能出现的 P2P 死锁
+        os.environ["NCCL_BLOCKING_WAIT"] = "1"  # 阻塞等待，报错时提供更多信息
+        # 可选：如果需要详细调试日志，取消下面的注释
+        # os.environ.setdefault("NCCL_DEBUG", "INFO")
+        
+        # 获取环境变量
+        if "LOCAL_RANK" in os.environ:
+            local_rank = int(os.environ["LOCAL_RANK"])
+            rank = int(os.environ.get("RANK", local_rank))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+        else:
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            local_rank = rank % torch.cuda.device_count()
+        
+        # 设置当前设备（必须在 init_process_group 之前）
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        
+        # 初始化进程组，设置超时时间为 30 分钟
+        # 如果使用 torchrun，环境变量会自动设置，不需要手动指定 init_method
+        # 如果手动启动，可以使用 init_method
+        if "MASTER_ADDR" in os.environ and "MASTER_PORT" in os.environ:
+            # torchrun 模式：使用环境变量自动初始化
+            dist.init_process_group(
+                backend="nccl",
+                timeout=timedelta(minutes=30)  # 30分钟超时
+            )
+        else:
+            # 手动模式：使用指定的 master_port
+            dist.init_process_group(
+                backend="nccl",
+                init_method=f"tcp://127.0.0.1:{args.master_port}",
+                rank=rank,
+                world_size=world_size,
+                timeout=timedelta(minutes=30)
+            )
+        
+        # 只在 rank 0 打印信息
+        if rank == 0:
+            print("="*70)
+            print("蛋白质侧链设计模型 - 训练 (DDP 模式)")
+            print("="*70)
+            print(f"DDP 模式: 启用 (world_size={world_size})")
+            print(f"设备: {device} (rank={rank}, local_rank={local_rank})")
+            print(f"NCCL_TIMEOUT: {os.environ.get('NCCL_TIMEOUT', 'default')}")
+    else:
+        # 单GPU模式
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        rank = 0
+        world_size = 1
+        local_rank = 0
+        
+        print("="*70)
+        print("蛋白质侧链设计模型 - 训练")
+        print("="*70)
+        print(f"设备: {device} (单GPU模式)")
+    
+    # 只在 rank 0 打印信息
+    if rank == 0:
+        print(f"PDB 路径: {args.pdb_path}")
+        print(f"批次大小: {args.batch_size} (每个GPU)")
+        if ddp_enabled:
+            print(f"总批次大小: {args.batch_size * world_size} (所有GPU)")
+        print(f"训练轮数: {args.epochs}")
+        print(f"扩散模型: 启用 (时间步数: {args.num_diffusion_steps})")
+        print(f"掩码比例: 动态 (Cosine Schedule, t=0时0%, t=1时100%)")
+        print(f"掩码策略: {args.masking_strategy}")
+        print("="*70)
     
     # 加载数据集
-    print("\n1. 加载数据集...")
+    if rank == 0:
+        print("\n1. 加载数据集...")
     
     # 尝试使用预定义的划分
     # 如果指定了 --use_predefined_split，或者 cache_dir 存在且包含 train.txt 和 val.txt，则使用预定义划分
@@ -166,12 +265,14 @@ def main():
             if not args.use_predefined_split:
                 # 自动检测：如果存在预定义文件，默认使用
                 use_predefined = True
-            print(f"   ✅ 使用预定义的数据集划分")
-            print(f"   训练集文件: {len(train_paths)} 个")
-            print(f"   验证集文件: {len(val_paths)} 个")
+            if rank == 0:
+                print(f"   ✅ 使用预定义的数据集划分")
+                print(f"   训练集文件: {len(train_paths)} 个")
+                print(f"   验证集文件: {len(val_paths)} 个")
         else:
             if args.use_predefined_split:
-                print(f"   ⚠️  预定义划分文件不存在，将使用随机划分")
+                if rank == 0:
+                    print(f"   ⚠️  预定义划分文件不存在，将使用随机划分")
                 use_predefined = False
             else:
                 use_predefined = False
@@ -179,70 +280,151 @@ def main():
     # 根据是否使用预定义划分来加载数据集
     if use_predefined and train_paths is not None and val_paths is not None:
         # 使用预定义的划分
+        # 训练集启用数据增强，验证集禁用数据增强以确保稳定的验证指标
         train_dataset = ProteinStructureDataset(
             train_paths,
-            cache_dir=args.cache_dir
+            cache_dir=args.cache_dir,
+            augment=True  # 训练时启用数据增强
         )
         val_dataset = ProteinStructureDataset(
             val_paths,
-            cache_dir=args.cache_dir
+            cache_dir=args.cache_dir,
+            augment=False  # 验证时禁用数据增强，确保稳定的验证损失
         )
-        print(f"   训练集: {len(train_dataset)} 个样本")
-        print(f"   验证集: {len(val_dataset)} 个样本")
+        if rank == 0:
+            print(f"   训练集: {len(train_dataset)} 个样本")
+            print(f"   验证集: {len(val_dataset)} 个样本")
     else:
         # 使用随机划分或全部数据
-        dataset = ProteinStructureDataset(
+        # 先创建一个临时数据集以获取大小和文件列表
+        temp_dataset = ProteinStructureDataset(
             args.pdb_path,
-            cache_dir=args.cache_dir
+            cache_dir=args.cache_dir,
+            augment=False  # 临时数据集，augment 参数不重要
         )
-        print(f"   数据集大小: {len(dataset)}")
-        if args.cache_dir:
-            print(f"   使用缓存目录: {args.cache_dir}")
+        if rank == 0:
+            print(f"   数据集大小: {len(temp_dataset)}")
+            if args.cache_dir:
+                print(f"   使用缓存目录: {args.cache_dir}")
         
         # 划分训练/验证集
         if args.val_split > 0:
-            val_size = int(len(dataset) * args.val_split)
-            train_size = len(dataset) - val_size
-            train_dataset, val_dataset = torch.utils.data.random_split(
-                dataset, [train_size, val_size]
+            val_size = int(len(temp_dataset) * args.val_split)
+            train_size = len(temp_dataset) - val_size
+            train_indices, val_indices = torch.utils.data.random_split(
+                range(len(temp_dataset)), [train_size, val_size]
             )
-            print(f"   训练集: {len(train_dataset)}, 验证集: {len(val_dataset)} (随机划分)")
+            
+            # 创建训练集（启用数据增强）
+            train_dataset = torch.utils.data.Subset(
+                ProteinStructureDataset(
+                    args.pdb_path,
+                    cache_dir=args.cache_dir,
+                    augment=True  # 训练时启用数据增强
+                ),
+                train_indices.indices
+            )
+            
+            # 创建验证集（禁用数据增强）
+            val_dataset = torch.utils.data.Subset(
+                ProteinStructureDataset(
+                    args.pdb_path,
+                    cache_dir=args.cache_dir,
+                    augment=False  # 验证时禁用数据增强，确保稳定的验证损失
+                ),
+                val_indices.indices
+            )
+            
+            if rank == 0:
+                print(f"   训练集: {len(train_dataset)}, 验证集: {len(val_dataset)} (随机划分)")
         else:
-            train_dataset = dataset
+            # 全部数据作为训练集，启用数据增强
+            train_dataset = ProteinStructureDataset(
+                args.pdb_path,
+                cache_dir=args.cache_dir,
+                augment=True  # 训练时启用数据增强
+            )
             val_dataset = None
     
     # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=False,
-        drop_last=True
-    )
-    
-    val_loader = None
-    if val_dataset is not None:
-        val_loader = DataLoader(
-            val_dataset,
+    # DDP 模式：使用 DistributedSampler
+    if ddp_enabled:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True  # 防止最后一个 batch 大小不一致导致的 DDP 同步挂起
+        )
+        train_loader = DataLoader(
+            train_dataset,
             batch_size=args.batch_size,
-            shuffle=False,
+            sampler=train_sampler,  # 使用 sampler 时不能设置 shuffle
+            collate_fn=collate_fn,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=False,  # 最安全的设置，防止 epoch 切换死锁
+            drop_last=True  # 强制设置，防止最后一个 batch 大小不一致
+        )
+        
+        val_sampler = None
+        if val_dataset is not None:
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,  # 验证集不需要 shuffle
+                drop_last=True
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                sampler=val_sampler,
+                collate_fn=collate_fn,
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=False,
+                drop_last=True
+            )
+        else:
+            val_loader = None
+    else:
+        # 单GPU模式：使用普通 DataLoader
+        train_sampler = None
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
             collate_fn=collate_fn,
             num_workers=4,
             pin_memory=True,
             persistent_workers=False,
             drop_last=True
         )
+        
+        val_loader = None
+        val_sampler = None
+        if val_dataset is not None:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=collate_fn,
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=False,
+                drop_last=True
+            )
     
     # 初始化模型
-    print("\n2. 初始化模型...")
+    if rank == 0:
+        print("\n2. 初始化模型...")
     vocab = get_vocab()
     encoder = BackboneEncoder(
         hidden_dim=args.hidden_dim,
         num_layers=args.num_encoder_layers,
-        k_neighbors=30
+        k_neighbors=30,
+        dropout=args.dropout  # 传递 dropout 参数以增强正则化
     )
     decoder = FragmentDecoder(
         input_dim=args.hidden_dim,
@@ -250,21 +432,48 @@ def main():
         num_torsion_bins=72,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_decoder_layers,
-        num_heads=args.num_heads
+        num_heads=args.num_heads,
+        dropout=args.dropout  # 传递 dropout 参数以增强正则化
     )
     
-    encoder_params = sum(p.numel() for p in encoder.parameters())
-    decoder_params = sum(p.numel() for p in decoder.parameters())
-    print(f"   Encoder 参数: {encoder_params:,}")
-    print(f"   Decoder 参数: {decoder_params:,}")
-    print(f"   总参数: {encoder_params + decoder_params:,}")
+    if rank == 0:
+        encoder_params = sum(p.numel() for p in encoder.parameters())
+        decoder_params = sum(p.numel() for p in decoder.parameters())
+        print(f"   Encoder 参数: {encoder_params:,}")
+        print(f"   Decoder 参数: {decoder_params:,}")
+        print(f"   总参数: {encoder_params + decoder_params:,}")
     
     # 移动到设备
     encoder.to(device)
     decoder.to(device)
     
+    # DDP 模式：在模型初始化后、DDP 包装前添加 barrier
+    # 确保 Rank 0 加载完配置/词表后，所有进程再一起包装 DDP
+    if ddp_enabled:
+        dist.barrier()
+        if rank == 0:
+            print("   ✅ 所有进程已完成模型初始化，开始 DDP 包装...")
+    
+    # DDP 模式：包装模型
+    if ddp_enabled:
+        encoder = torch.nn.parallel.DistributedDataParallel(
+            encoder,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False  # 如果所有参数都被使用，设为 False 可以提升性能
+        )
+        decoder = torch.nn.parallel.DistributedDataParallel(
+            decoder,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False
+        )
+        if rank == 0:
+            print(f"   ✅ 模型已包装为 DDP (device_id={local_rank})")
+    
     # 初始化训练器
-    print("\n3. 初始化训练器...")
+    if rank == 0:
+        print("\n3. 初始化训练器...")
     trainer = Trainer(
         encoder=encoder,
         decoder=decoder,
@@ -276,13 +485,19 @@ def main():
         masking_strategy=args.masking_strategy,
         num_diffusion_steps=args.num_diffusion_steps,
         warmup_epochs=args.warmup_epochs,
-        total_epochs=args.epochs
+        total_epochs=args.epochs,
+        ddp_enabled=ddp_enabled,
+        rank=rank,
+        world_size=world_size,
+        train_sampler=train_sampler,
+        val_sampler=val_sampler
     )
     
     # 开始训练
-    print("\n4. 开始训练...")
-    if args.visualize:
-        print(f"   可视化: 启用 (每 {args.plot_every} 个 epoch 绘制一次)")
+    if rank == 0:
+        print("\n4. 开始训练...")
+        if args.visualize:
+            print(f"   可视化: 启用 (每 {args.plot_every} 个 epoch 绘制一次)")
     trainer.train(
         num_epochs=args.epochs,
         save_dir=args.save_dir,
@@ -294,11 +509,25 @@ def main():
         early_stopping_min_delta=args.early_stopping_min_delta
     )
     
-    print("\n" + "="*70)
-    print("训练完成！")
-    print(f"模型保存在: {args.save_dir}")
-    print("="*70)
+    # 清理 DDP
+    if ddp_enabled:
+        dist.destroy_process_group()
+    
+    if rank == 0:
+        print("\n" + "="*70)
+        print("训练完成！")
+        print(f"模型保存在: {args.save_dir}")
+        print("="*70)
 
 
 if __name__ == "__main__":
+    # 关键：在 if __name__ == "__main__": 的最开始解析参数
+    # 这样可以在所有 torch 引用之前设置 CUDA_VISIBLE_DEVICES
+    _args = parse_args()
+    
+    # 将 args 存储到全局命名空间，供 main() 使用
+    # main() 函数内部会在最开始设置 CUDA_VISIBLE_DEVICES
+    globals()['_args'] = _args
+    
+    # 调用主函数（main() 内部会设置 CUDA_VISIBLE_DEVICES 并导入 torch 等模块）
     main()
