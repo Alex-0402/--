@@ -25,8 +25,8 @@ echo "PyTorch 逻辑编号: 0,1,2,3,4,5,6,7 (通过 --gpu_ids 映射)"
 echo ""
 
 torchrun --nproc_per_node=8 --master_port=29506 train.py \
-    --pdb_path data/cache \
-    --cache_dir data/cache \
+    --pdb_path data/cache_20000 \
+    --cache_dir data/cache_20000 \
     --batch_size 4 \
     --epochs 600 \
     --gpu_ids "0,1,2,3,4,5,6,7" \
@@ -37,6 +37,8 @@ torchrun --nproc_per_node=8 --master_port=29506 train.py \
     --learning_rate 5e-4 \
     --early_stopping_patience 50 \
     --early_stopping_min_delta 0.001 \
+    --dropout 0.3 \
+    --save_dir checkpoints_20000
     #--resume checkpoints/best_model.pt  # 可选：从断点继续训练
 
 echo ""

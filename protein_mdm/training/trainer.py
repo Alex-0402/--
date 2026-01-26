@@ -139,7 +139,8 @@ class Trainer:
         fragment_targets: torch.Tensor,
         torsion_targets: torch.Tensor,
         fragment_mask: Optional[torch.Tensor] = None,
-        offset_logits: Optional[torch.Tensor] = None
+        offset_logits: Optional[torch.Tensor] = None,
+        torsion_raw: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         计算损失
@@ -278,21 +279,99 @@ class Trainer:
         # 保持返回字典结构不变，返回 0.0
         structure_loss = torch.tensor(0.0, device=fragment_logits.device)
         
-        # 4. Offset Loss：L2 正则化，防止 offset 过大，同时打通计算图
-        # 简单的正则化策略，让 offset_logits 参与计算图，解决 DDP 未使用参数报错
-        if offset_logits is not None:
+        # 4. Offset Loss：真实的回归损失（Regression Loss）
+        # 计算预测的 offset 与真实 offset 之间的 MSE Loss
+        if offset_logits is not None and torsion_raw is not None:
             # 检查是否有无效值
             if torch.isnan(offset_logits).any() or torch.isinf(offset_logits).any():
                 offset_loss = torch.tensor(0.0, device=fragment_logits.device)
             else:
-                # L2 正则化：惩罚大的 offset 值
-                # 使用更大的权重（10.0）以确保 offset_loss 在日志中可见且有足够的梯度贡献
-                offset_loss = 10.0 * torch.mean(offset_logits ** 2)
-                # 检查结果是否为 NaN
-                if torch.isnan(offset_loss) or torch.isinf(offset_loss):
+                # 获取 batch 和序列维度信息
+                batch_size, frag_seq_len, num_bins = torsion_logits.shape
+                
+                # 确保 torsion_targets 和 torsion_raw 的维度正确
+                if torsion_targets.dim() == 1:
+                    torsion_targets = torsion_targets.view(batch_size, -1)
+                if torsion_raw.dim() == 1:
+                    torsion_raw = torsion_raw.view(batch_size, -1)
+                
+                # 对齐长度（与 torsion_loss 计算保持一致）
+                tors_target_len = torsion_targets.shape[1]
+                tors_raw_len = torsion_raw.shape[1]
+                min_len = min(frag_seq_len, tors_target_len, tors_raw_len)
+                
+                if min_len > 0:
+                    # 截取有效长度
+                    torsion_targets_trimmed = torsion_targets[:, :min_len]  # [batch_size, min_len]
+                    torsion_raw_trimmed = torsion_raw[:, :min_len]  # [batch_size, min_len]
+                    offset_logits_trimmed = offset_logits[:, :min_len, :]  # [batch_size, min_len, num_bins]
+                    
+                    # 过滤无效的 torsion_targets（超出范围的值）
+                    valid_mask = (torsion_targets_trimmed >= 0) & (torsion_targets_trimmed < num_bins)
+                    
+                    if valid_mask.sum() > 0:
+                        # 计算 bin 宽度和中心
+                        bin_width = 2 * np.pi / num_bins
+                        
+                        # 将 bin 索引转换为 bin 中心角度（弧度）
+                        # bin 中心 = (bin_idx + 0.5) * bin_width - π
+                        bin_indices_float = torsion_targets_trimmed.float()  # [batch_size, min_len]
+                        bin_centers = (bin_indices_float + 0.5) * bin_width - np.pi  # [batch_size, min_len]
+                        
+                        # 计算目标 offset：真实角度相对于 bin 中心的偏移（归一化到 bin 宽度）
+                        # diff = (torsion_raw - bin_center) / bin_width
+                        diff = (torsion_raw_trimmed - bin_centers) / bin_width  # [batch_size, min_len]
+                        
+                        # 周期性边界处理：确保 offset 在 [-0.5, 0.5] 范围内
+                        # 使用公式: (diff + 0.5) % 1 - 0.5
+                        target_offsets = (diff + 0.5) % 1.0 - 0.5  # [batch_size, min_len]
+                        
+                        # 从 offset_logits 中根据 torsion_targets 选择对应的 offset 预测值
+                        # offset_logits: [batch_size, min_len, num_bins]
+                        # torsion_targets_trimmed: [batch_size, min_len]
+                        # 使用 gather 选择每个位置对应 bin 的 offset 预测
+                        bin_indices = torsion_targets_trimmed.long().unsqueeze(-1)  # [batch_size, min_len, 1]
+                        predicted_offsets = torch.gather(
+                            offset_logits_trimmed, 
+                            dim=2, 
+                            index=bin_indices
+                        ).squeeze(-1)  # [batch_size, min_len]
+                        
+                        # 计算 MSE Loss（只对有效位置）
+                        loss_fn = nn.MSELoss(reduction='none')
+                        loss_per_element = loss_fn(predicted_offsets, target_offsets)  # [batch_size, min_len]
+                        
+                        # 应用有效掩码
+                        masked_loss = loss_per_element * valid_mask.float()  # [batch_size, min_len]
+                        
+                        # 计算平均损失（只对有效位置）
+                        num_valid = valid_mask.sum().float()
+                        if num_valid > 0:
+                            offset_loss = 10.0 * masked_loss.sum() / num_valid
+                        else:
+                            offset_loss = torch.tensor(0.0, device=fragment_logits.device)
+                        
+                        # 检查结果是否为 NaN
+                        if torch.isnan(offset_loss) or torch.isinf(offset_loss):
+                            offset_loss = torch.tensor(0.0, device=fragment_logits.device)
+                    else:
+                        # 所有值都无效，损失为 0
+                        offset_loss = torch.tensor(0.0, device=fragment_logits.device)
+                else:
+                    # 没有有效的扭转角，损失为 0
                     offset_loss = torch.tensor(0.0, device=fragment_logits.device)
         else:
-            offset_loss = torch.tensor(0.0, device=fragment_logits.device)
+            # 如果没有提供 torsion_raw，回退到 L2 正则化（保持向后兼容）
+            if offset_logits is not None:
+                if torch.isnan(offset_logits).any() or torch.isinf(offset_logits).any():
+                    offset_loss = torch.tensor(0.0, device=fragment_logits.device)
+                else:
+                    # L2 正则化：惩罚大的 offset 值
+                    offset_loss = 100.0 * torch.mean(offset_logits ** 2)
+                    if torch.isnan(offset_loss) or torch.isinf(offset_loss):
+                        offset_loss = torch.tensor(0.0, device=fragment_logits.device)
+            else:
+                offset_loss = torch.tensor(0.0, device=fragment_logits.device)
         
         # 总损失（加权组合，缓解 Torsion Loss 过拟合）
         # - fragment_loss: 权重 1.0（主要损失）
@@ -348,6 +427,9 @@ class Trainer:
                 backbone_coords = batch['backbone_coords'].to(self.device)
                 fragment_token_ids = batch['fragment_token_ids'].to(self.device)
                 torsion_bins = batch['torsion_bins'].to(self.device)
+                torsion_raw = batch.get('torsion_raw', None)
+                if torsion_raw is not None:
+                    torsion_raw = torsion_raw.to(self.device)
                 sequence_lengths = batch['sequence_lengths'].to(self.device)
                 
                 # 创建掩码（离散扩散模式：采样时间步）
@@ -389,12 +471,13 @@ class Trainer:
                     sequence_lengths=sequence_lengths
                 )
                 
-                # 计算损失（传入 offset_logits 以解决 DDP 未使用参数报错）
+                # 计算损失（传入 offset_logits 和 torsion_raw 以计算真实的回归损失）
                 losses = self.compute_loss(
                     frag_logits, tors_logits,
                     fragment_token_ids, torsion_bins,
                     fragment_mask=fragment_masks,
-                    offset_logits=offset_logits
+                    offset_logits=offset_logits,
+                    torsion_raw=torsion_raw
                 )
                 
                 # 检查损失是否为 NaN 或 Inf
@@ -489,6 +572,9 @@ class Trainer:
         if self.val_loader is None:
             return {}
         
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         # DDP 模式：在验证开始前同步所有进程
         if self.ddp_enabled:
             dist.barrier()
@@ -512,101 +598,116 @@ class Trainer:
                 val_batch_idx += 1
                 if val_batch_idx % 5 == 0 and self.rank == 0:
                     print(f"验证进度: {val_batch_idx}/{total_val_batches}")
-                backbone_coords = batch['backbone_coords'].to(self.device)
-                fragment_token_ids = batch['fragment_token_ids'].to(self.device)
-                torsion_bins = batch['torsion_bins'].to(self.device)
-                sequence_lengths = batch['sequence_lengths'].to(self.device)
-                
-                # 检查输入数据
-                if torch.isnan(backbone_coords).any() or torch.isinf(backbone_coords).any():
-                    if self.rank == 0:
-                        print(f"  ⚠️  警告: backbone_coords 包含 NaN/Inf，跳过此批次")
-                    continue
-                
-                # 创建掩码（验证时也使用离散扩散，采样时间步）
-                # 为每个样本随机采样时间步 t ∈ [1, T]（归一化到 [0, 1]）
-                batch_size = fragment_token_ids.shape[0]
-                timesteps = torch.randint(
-                    1, self.num_diffusion_steps + 1,
-                    size=(batch_size,),
-                    device=self.device
-                ).float() / self.num_diffusion_steps
-                
-                fragment_masks = create_masks(
-                    fragment_token_ids,
-                    strategy=self.masking_strategy,
-                    timesteps=timesteps,
-                    use_cosine_schedule=True
-                )
-                
-                # 应用掩码
-                masked_fragments = apply_masks(fragment_token_ids, fragment_masks)
-                
-                # 前向传播（传递残基类型以支持理化特征）
                 try:
-                    residue_types = batch.get('residue_types', None)
-                    node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=residue_types)
-                    if torch.isnan(node_embeddings).any() or torch.isinf(node_embeddings).any():
+                    backbone_coords = batch['backbone_coords'].to(self.device)
+                    fragment_token_ids = batch['fragment_token_ids'].to(self.device)
+                    torsion_bins = batch['torsion_bins'].to(self.device)
+                    torsion_raw = batch.get('torsion_raw', None)
+                    if torsion_raw is not None:
+                        torsion_raw = torsion_raw.to(self.device)
+                    sequence_lengths = batch['sequence_lengths'].to(self.device)
+                    
+                    # 检查输入数据
+                    if torch.isnan(backbone_coords).any() or torch.isinf(backbone_coords).any():
                         if self.rank == 0:
-                            print(f"  ⚠️  警告: encoder 输出包含 NaN/Inf，跳过此批次")
+                            print(f"  ⚠️  警告: backbone_coords 包含 NaN/Inf，跳过此批次")
                         continue
                     
+                    # 创建掩码（验证时也使用离散扩散，采样时间步）
+                    # 为每个样本随机采样时间步 t ∈ [1, T]（归一化到 [0, 1]）
+                    batch_size = fragment_token_ids.shape[0]
+                    timesteps = torch.randint(
+                        1, self.num_diffusion_steps + 1,
+                        size=(batch_size,),
+                        device=self.device
+                    ).float() / self.num_diffusion_steps
+                    
+                    fragment_masks = create_masks(
+                        fragment_token_ids,
+                        strategy=self.masking_strategy,
+                        timesteps=timesteps,
+                        use_cosine_schedule=True
+                    )
+                    
+                    # 应用掩码
+                    masked_fragments = apply_masks(fragment_token_ids, fragment_masks)
+                    
+                    # 前向传播（传递残基类型以支持理化特征）
                     try:
-                        frag_logits, tors_logits, offset_logits = self.decoder(
-                            node_embeddings=node_embeddings,
-                            target_fragments=masked_fragments,
-                            sequence_lengths=sequence_lengths
-                        )
+                        residue_types = batch.get('residue_types', None)
+                        node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=residue_types)
+                        if torch.isnan(node_embeddings).any() or torch.isinf(node_embeddings).any():
+                            if self.rank == 0:
+                                print(f"  ⚠️  警告: encoder 输出包含 NaN/Inf，跳过此批次")
+                            continue
+                        
+                        try:
+                            frag_logits, tors_logits, offset_logits = self.decoder(
+                                node_embeddings=node_embeddings,
+                                target_fragments=masked_fragments,
+                                sequence_lengths=sequence_lengths
+                            )
+                        except Exception as e:
+                            if isinstance(e, torch.cuda.OutOfMemoryError):
+                                raise
+                            if self.rank == 0:
+                                print(f"  ⚠️  警告: decoder 前向传播失败: {e}，跳过此批次")
+                                import traceback
+                                traceback.print_exc()
+                            continue
+                        
+                        if torch.isnan(frag_logits).any() or torch.isinf(frag_logits).any():
+                            if self.rank == 0:
+                                print(f"  ⚠️  警告: fragment_logits 包含 NaN/Inf，跳过此批次")
+                                print(f"      NaN 数量: {torch.isnan(frag_logits).sum().item()}, Inf 数量: {torch.isinf(frag_logits).sum().item()}")
+                                print(f"      Fragment logits 统计: min={frag_logits.min().item():.4f}, max={frag_logits.max().item():.4f}, mean={frag_logits.mean().item():.4f}")
+                                print(f"      Node embeddings 统计: min={node_embeddings.min().item():.4f}, max={node_embeddings.max().item():.4f}, mean={node_embeddings.mean().item():.4f}")
+                                print(f"      Masked fragments 范围: min={masked_fragments.min().item()}, max={masked_fragments.max().item()}")
+                            continue
+                        if torch.isnan(tors_logits).any() or torch.isinf(tors_logits).any():
+                            if self.rank == 0:
+                                print(f"  ⚠️  警告: torsion_logits 包含 NaN/Inf，跳过此批次")
+                            continue
                     except Exception as e:
+                        if isinstance(e, torch.cuda.OutOfMemoryError):
+                            raise
                         if self.rank == 0:
-                            print(f"  ⚠️  警告: decoder 前向传播失败: {e}，跳过此批次")
-                            import traceback
-                            traceback.print_exc()
+                            print(f"  ⚠️  警告: 前向传播失败: {e}，跳过此批次")
                         continue
                     
-                    if torch.isnan(frag_logits).any() or torch.isinf(frag_logits).any():
+                    # 计算损失（传入 offset_logits 和 torsion_raw 以计算真实的回归损失）
+                    losses = self.compute_loss(
+                        frag_logits, tors_logits,
+                        fragment_token_ids, torsion_bins,
+                        fragment_mask=fragment_masks,
+                        offset_logits=offset_logits,
+                        torsion_raw=torsion_raw
+                    )
+                    
+                    # 检查损失是否为 NaN 或 Inf
+                    if torch.isnan(losses['total_loss']) or torch.isinf(losses['total_loss']):
                         if self.rank == 0:
-                            print(f"  ⚠️  警告: fragment_logits 包含 NaN/Inf，跳过此批次")
-                            print(f"      NaN 数量: {torch.isnan(frag_logits).sum().item()}, Inf 数量: {torch.isinf(frag_logits).sum().item()}")
-                            print(f"      Fragment logits 统计: min={frag_logits.min().item():.4f}, max={frag_logits.max().item():.4f}, mean={frag_logits.mean().item():.4f}")
-                            print(f"      Node embeddings 统计: min={node_embeddings.min().item():.4f}, max={node_embeddings.max().item():.4f}, mean={node_embeddings.mean().item():.4f}")
-                            print(f"      Masked fragments 范围: min={masked_fragments.min().item()}, max={masked_fragments.max().item()}")
+                            print(f"  ⚠️  警告: 批次 {num_batches} 的损失为 NaN/Inf，跳过")
+                            print(f"      Fragment loss: {losses['fragment_loss']}")
+                            print(f"      Torsion loss: {losses['torsion_loss']}")
+                            print(f"      Fragment logits shape: {frag_logits.shape}, contains NaN: {torch.isnan(frag_logits).any()}")
+                            print(f"      Torsion logits shape: {tors_logits.shape}, contains NaN: {torch.isnan(tors_logits).any()}")
+                            print(f"      Fragment targets shape: {fragment_token_ids.shape}, min: {fragment_token_ids.min()}, max: {fragment_token_ids.max()}")
+                            print(f"      Torsion targets shape: {torsion_bins.shape}, min: {torsion_bins.min()}, max: {torsion_bins.max()}")
                         continue
-                    if torch.isnan(tors_logits).any() or torch.isinf(tors_logits).any():
-                        if self.rank == 0:
-                            print(f"  ⚠️  警告: torsion_logits 包含 NaN/Inf，跳过此批次")
-                        continue
-                except Exception as e:
+                    
+                    total_loss += losses['total_loss'].item()
+                    total_fragment_loss += losses['fragment_loss'].item()
+                    total_torsion_loss += losses['torsion_loss'].item()
+                    total_structure_loss += losses.get('structure_loss', torch.tensor(0.0)).item()
+                    total_offset_loss += losses.get('offset_loss', torch.tensor(0.0)).item()
+                    num_batches += 1
+                except torch.cuda.OutOfMemoryError as e:
                     if self.rank == 0:
-                        print(f"  ⚠️  警告: 前向传播失败: {e}，跳过此批次")
+                        print(f"  ⚠️  验证 OOM: {e}，已清理显存并跳过该 Batch")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     continue
-                
-                # 计算损失（传入 offset_logits 以解决 DDP 未使用参数报错）
-                losses = self.compute_loss(
-                    frag_logits, tors_logits,
-                    fragment_token_ids, torsion_bins,
-                    fragment_mask=fragment_masks,
-                    offset_logits=offset_logits
-                )
-                
-                # 检查损失是否为 NaN 或 Inf
-                if torch.isnan(losses['total_loss']) or torch.isinf(losses['total_loss']):
-                    if self.rank == 0:
-                        print(f"  ⚠️  警告: 批次 {num_batches} 的损失为 NaN/Inf，跳过")
-                        print(f"      Fragment loss: {losses['fragment_loss']}")
-                        print(f"      Torsion loss: {losses['torsion_loss']}")
-                        print(f"      Fragment logits shape: {frag_logits.shape}, contains NaN: {torch.isnan(frag_logits).any()}")
-                        print(f"      Torsion logits shape: {tors_logits.shape}, contains NaN: {torch.isnan(tors_logits).any()}")
-                        print(f"      Fragment targets shape: {fragment_token_ids.shape}, min: {fragment_token_ids.min()}, max: {fragment_token_ids.max()}")
-                        print(f"      Torsion targets shape: {torsion_bins.shape}, min: {torsion_bins.min()}, max: {torsion_bins.max()}")
-                    continue
-                
-                total_loss += losses['total_loss'].item()
-                total_fragment_loss += losses['fragment_loss'].item()
-                total_torsion_loss += losses['torsion_loss'].item()
-                total_structure_loss += losses.get('structure_loss', torch.tensor(0.0)).item()
-                total_offset_loss += losses.get('offset_loss', torch.tensor(0.0)).item()
-                num_batches += 1
         
         # DDP 模式：聚合所有进程的验证损失
         if self.ddp_enabled and num_batches > 0:

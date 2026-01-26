@@ -290,13 +290,17 @@ class ProteinStructureDataset(Dataset):
             if len(torsion_angles) > 0:
                 torsion_bins = discretize_angles(np.array(torsion_angles), num_bins=72)
                 torsion_tensor = torch.tensor(torsion_bins, dtype=torch.long)
+                # 保存原始的浮点角度值（弧度），用于回归损失计算
+                torsion_raw_tensor = torch.tensor(torsion_angles, dtype=torch.float32)
             else:
                 torsion_tensor = torch.tensor([], dtype=torch.long)
+                torsion_raw_tensor = torch.tensor([], dtype=torch.float32)
             
             data = {
                 'backbone_coords': backbone_tensor,
                 'fragment_token_ids': fragment_tensor,
                 'torsion_bins': torsion_tensor,
+                'torsion_raw': torsion_raw_tensor,  # 原始浮点角度值（弧度）
                 'residue_types': residue_types,
                 'sequence_length': torch.tensor(len(backbone_coords), dtype=torch.long),
                 'pdb_path': pdb_path
@@ -550,6 +554,7 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
             'backbone_coords': torch.zeros((0, 1, 4, 3), dtype=torch.float32),
             'fragment_token_ids': torch.zeros((0, 1), dtype=torch.long),
             'torsion_bins': torch.zeros((0, 1), dtype=torch.long),
+            'torsion_raw': torch.zeros((0, 1), dtype=torch.float32),
             'sequence_lengths': torch.zeros(0, dtype=torch.long),
             'residue_types': [],
             'pdb_paths': []
@@ -575,6 +580,10 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         (batch_size, max_torsions),
         dtype=torch.long
     )
+    torsion_raw_batch = torch.zeros(
+        (batch_size, max_torsions),
+        dtype=torch.float32
+    )
     seq_lengths = torch.zeros(batch_size, dtype=torch.long)
     
     # Fill in the batch
@@ -586,12 +595,16 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         backbone_batch[i, :seq_len] = item['backbone_coords']
         fragment_batch[i, :frag_len] = item['fragment_token_ids']
         torsion_batch[i, :tors_len] = item['torsion_bins']
+        # torsion_raw 使用 0 填充（后续会被 mask 掉）
+        if tors_len > 0:
+            torsion_raw_batch[i, :tors_len] = item['torsion_raw']
         seq_lengths[i] = seq_len
     
     return {
         'backbone_coords': backbone_batch,
         'fragment_token_ids': fragment_batch,
         'torsion_bins': torsion_batch,
+        'torsion_raw': torsion_raw_batch,  # 原始浮点角度值（弧度）
         'sequence_lengths': seq_lengths,
         'residue_types': [item['residue_types'] for item in valid_batch],
         'pdb_paths': [item['pdb_path'] for item in valid_batch]

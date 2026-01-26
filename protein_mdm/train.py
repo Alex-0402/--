@@ -142,6 +142,8 @@ def parse_args():
 
 
 def main():
+    # 缓解显存碎片化，降低 OOM 概率（必须在任何 torch/cuda 调用之前设置）
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     # 关键：在 main 函数最开始解析参数并设置 CUDA_VISIBLE_DEVICES
     # 这必须在任何 torch cuda 调用之前完成
     args = globals().get('_args')
@@ -376,9 +378,10 @@ def main():
                 shuffle=False,  # 验证集不需要 shuffle
                 drop_last=True
             )
+            val_batch_size = max(1, args.batch_size // 2)  # 验证集减半以降低显存压力
             val_loader = DataLoader(
                 val_dataset,
-                batch_size=args.batch_size,
+                batch_size=val_batch_size,
                 sampler=val_sampler,
                 collate_fn=collate_fn,
                 num_workers=4,
@@ -405,9 +408,10 @@ def main():
         val_loader = None
         val_sampler = None
         if val_dataset is not None:
+            val_batch_size = max(1, args.batch_size // 2)  # 验证集减半以降低显存压力
             val_loader = DataLoader(
                 val_dataset,
-                batch_size=args.batch_size,
+                batch_size=val_batch_size,
                 shuffle=False,
                 collate_fn=collate_fn,
                 num_workers=4,
