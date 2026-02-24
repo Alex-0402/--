@@ -1,6 +1,37 @@
 #!/bin/bash
 # 8 GPU DDP 训练启动脚本（使用 GPU 0-7，共8张卡）
 
+set -euo pipefail
+
+# 切换到脚本所在目录，确保从任意路径启动都能找到 train.py
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# 用法说明
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    echo "用法: bash run_8gpu.sh [--debug_mode] [其他 train.py 参数]"
+    echo "示例(稳定模式): bash run_8gpu.sh"
+    echo "示例(调试模式): bash run_8gpu.sh --debug_mode"
+    echo "示例(附加参数): bash run_8gpu.sh --debug_mode --resume checkpoints_20000/best_model.pt"
+    exit 0
+fi
+
+# 参数解析：支持开关调试模式，并透传其余参数给 train.py
+DEBUG_MODE=false
+EXTRA_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--debug_mode" ]]; then
+        DEBUG_MODE=true
+    else
+        EXTRA_ARGS+=("$arg")
+    fi
+done
+
+DEBUG_ARG=""
+if [[ "$DEBUG_MODE" == true ]]; then
+    DEBUG_ARG="--debug_mode"
+fi
+
 # 杀掉残留进程
 echo "清理残留进程..."
 pkill -f "train.py" || true
@@ -22,6 +53,11 @@ export NCCL_TIMEOUT=1800     # 30分钟超时
 echo "启动 8 GPU DDP 训练..."
 echo "使用 GPU: 0,1,2,3,4,5,6,7 (物理编号)"
 echo "PyTorch 逻辑编号: 0,1,2,3,4,5,6,7 (通过 --gpu_ids 映射)"
+if [[ "$DEBUG_MODE" == true ]]; then
+    echo "模式: 调试模式 (debug_mode=ON)"
+else
+    echo "模式: 稳定模式 (debug_mode=OFF)"
+fi
 echo ""
 
 torchrun --nproc_per_node=8 --master_port=29506 train.py \
@@ -38,7 +74,9 @@ torchrun --nproc_per_node=8 --master_port=29506 train.py \
     --early_stopping_patience 50 \
     --early_stopping_min_delta 0.001 \
     --dropout 0.3 \
-    --save_dir checkpoints_20000
+    --save_dir checkpoints_20000 \
+    ${DEBUG_ARG} \
+    "${EXTRA_ARGS[@]}"
     #--resume checkpoints/best_model.pt  # 可选：从断点继续训练
 
 echo ""

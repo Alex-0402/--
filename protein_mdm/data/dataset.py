@@ -556,6 +556,8 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
             'torsion_bins': torch.zeros((0, 1), dtype=torch.long),
             'torsion_raw': torch.zeros((0, 1), dtype=torch.float32),
             'sequence_lengths': torch.zeros(0, dtype=torch.long),
+            'fragment_lengths': torch.zeros(0, dtype=torch.long),
+            'torsion_lengths': torch.zeros(0, dtype=torch.long),
             'residue_types': [],
             'pdb_paths': []
         }
@@ -585,6 +587,8 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         dtype=torch.float32
     )
     seq_lengths = torch.zeros(batch_size, dtype=torch.long)
+    fragment_lengths = torch.zeros(batch_size, dtype=torch.long)
+    torsion_lengths = torch.zeros(batch_size, dtype=torch.long)
     
     # Fill in the batch
     for i, item in enumerate(valid_batch):
@@ -596,9 +600,14 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         fragment_batch[i, :frag_len] = item['fragment_token_ids']
         torsion_batch[i, :tors_len] = item['torsion_bins']
         # torsion_raw 使用 0 填充（后续会被 mask 掉）
-        if tors_len > 0:
+        if tors_len > 0 and 'torsion_raw' in item:
             torsion_raw_batch[i, :tors_len] = item['torsion_raw']
+        else:
+            # 如果缺少 torsion_raw 字段，用 0 填充
+            torsion_raw_batch[i, :tors_len] = 0
         seq_lengths[i] = seq_len
+        fragment_lengths[i] = frag_len
+        torsion_lengths[i] = tors_len
     
     return {
         'backbone_coords': backbone_batch,
@@ -606,6 +615,8 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         'torsion_bins': torsion_batch,
         'torsion_raw': torsion_raw_batch,  # 原始浮点角度值（弧度）
         'sequence_lengths': seq_lengths,
+        'fragment_lengths': fragment_lengths,
+        'torsion_lengths': torsion_lengths,
         'residue_types': [item['residue_types'] for item in valid_batch],
         'pdb_paths': [item['pdb_path'] for item in valid_batch]
     }

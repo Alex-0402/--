@@ -246,10 +246,13 @@ class FragmentDecoder(nn.Module):
             device: 设备
         
         Returns:
-            掩码 [seq_len, seq_len]，True 表示可以关注，False 表示不能关注
+            掩码 [seq_len, seq_len]，True 表示不能关注（被屏蔽）
         """
-        mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=1)
-        return ~mask  # 反转：True 表示可以关注
+        # PyTorch Transformer 的布尔掩码语义：True 表示该位置会被屏蔽
+        return torch.triu(
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
+            diagonal=1
+        )
     
     def forward(
         self,

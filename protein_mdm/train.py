@@ -129,6 +129,8 @@ def parse_args():
                        help="早停耐心值，验证损失连续N轮不下降则停止训练（默认 50，给模型更多震荡收敛的时间）")
     parser.add_argument("--early_stopping_min_delta", type=float, default=0.0,
                        help="早停最小改进阈值，只有改进超过此值才认为是有效改进")
+    parser.add_argument("--debug_mode", action="store_true",
+                       help="启用详细调试日志（包含traceback和张量统计信息）")
     
     # DDP 相关参数
     parser.add_argument("--gpu_ids", type=str, default=None,
@@ -494,7 +496,8 @@ def main():
         rank=rank,
         world_size=world_size,
         train_sampler=train_sampler,
-        val_sampler=val_sampler
+        val_sampler=val_sampler,
+        debug_mode=args.debug_mode
     )
     
     # 开始训练

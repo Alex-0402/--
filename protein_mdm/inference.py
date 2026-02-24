@@ -31,14 +31,6 @@ def main():
                        help="设备 (cuda/cpu)")
     parser.add_argument("--hidden_dim", type=int, default=256,
                        help="隐藏层维度（需与训练时一致）")
-    parser.add_argument("--num_encoder_layers", type=int, default=3,
-                       help="Encoder 层数（需与训练时一致）")
-    parser.add_argument("--num_decoder_layers", type=int, default=3,
-                       help="Decoder 层数（需与训练时一致）")
-    parser.add_argument("--num_heads", type=int, default=8,
-                       help="注意力头数（需与训练时一致）")
-    parser.add_argument("--num_iterations", type=int, default=10,
-                       help="自适应迭代推理的迭代轮数（默认10）")
     
     args = parser.parse_args()
     
@@ -60,17 +52,12 @@ def main():
     print("\n1. 加载模型...")
     vocab = get_vocab()
     
-    encoder = BackboneEncoder(
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_encoder_layers
-    )
+    encoder = BackboneEncoder(hidden_dim=args.hidden_dim, num_layers=3)
     decoder = FragmentDecoder(
         input_dim=args.hidden_dim,
         vocab_size=vocab.get_vocab_size(),
         num_torsion_bins=72,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_decoder_layers,
-        num_heads=args.num_heads
+        hidden_dim=args.hidden_dim
     )
     
     checkpoint = torch.load(args.model_path, map_location=device)
@@ -94,12 +81,12 @@ def main():
     print(f"   序列长度: {sequence_length}")
     print(f"   骨架形状: {backbone_coords.shape}")
     
-    # 生成侧链（自适应迭代推理）
-    print("\n3. 生成侧链（自适应迭代推理）...")
-    num_iterations = args.num_iterations
-    print(f"   迭代轮数: {num_iterations}")
-    
-    with torch.no_grad():
+        # 生成侧链（自适应迭代推理）
+        print("\n3. 生成侧链（自适应迭代推理）...")
+        num_iterations = 10  # 迭代轮数
+        print(f"   迭代轮数: {num_iterations}")
+        
+        with torch.no_grad():
             # Encoder
             residue_types = sample.get('residue_types', None)
             if residue_types is not None:

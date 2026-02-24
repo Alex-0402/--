@@ -33,6 +33,7 @@ def create_masks(
     strategy: str = "random",
     timesteps: Optional[torch.Tensor] = None,
     use_cosine_schedule: bool = True,
+    valid_mask: Optional[torch.Tensor] = None,
     **kwargs
 ) -> torch.Tensor:
     """
@@ -43,6 +44,7 @@ def create_masks(
         strategy: 掩码策略 ("random", "block")
         timesteps: 时间步 [batch_size] 或标量，范围 [0, 1]（用于离散扩散）
         use_cosine_schedule: 是否使用 Cosine Schedule（默认True）
+        valid_mask: 有效位置掩码 [batch_size, M]，True 表示可被掩码的位置
         **kwargs: 其他策略参数
     
     Returns:
@@ -50,6 +52,10 @@ def create_masks(
     """
     batch_size, num_fragments = fragment_token_ids.shape
     device = fragment_token_ids.device
+
+    # 如果未显式提供 valid_mask，默认仅在非 PAD 位置进行掩码
+    if valid_mask is None:
+        valid_mask = fragment_token_ids != int(SpecialTokens.PAD)
     
     # 使用离散扩散模式：根据时间步计算动态 mask_ratio
     if timesteps is not None and use_cosine_schedule:
@@ -69,12 +75,19 @@ def create_masks(
         current_mask_ratio = dynamic_mask_ratios[i].item() if isinstance(dynamic_mask_ratios, torch.Tensor) else dynamic_mask_ratios
         
         if strategy == "random":
-            # 随机掩码
-            num_masked = int(num_fragments * current_mask_ratio)
             mask = torch.zeros(num_fragments, dtype=torch.bool, device=device)
-            if num_masked > 0:
-                indices = torch.randperm(num_fragments, device=device)[:num_masked]
-                mask[indices] = True
+
+            # 候选位置：优先使用 valid_mask，否则默认所有位置
+            candidate_indices = torch.where(valid_mask[i])[0]
+
+            num_candidates = int(candidate_indices.numel())
+            if num_candidates > 0:
+                # 随机掩码（按有效长度计算）
+                num_masked = int(num_candidates * current_mask_ratio)
+                if num_masked > 0:
+                    perm = torch.randperm(num_candidates, device=device)[:num_masked]
+                    selected = candidate_indices[perm]
+                    mask[selected] = True
         
         elif strategy == "block":
             # 块状掩码
@@ -86,6 +99,10 @@ def create_masks(
                 start = torch.randint(0, max(1, num_fragments - block_size), (1,)).item()
                 end = min(start + block_size, num_fragments)
                 mask[start:end] = True
+
+            # 如果提供了 valid_mask，确保无效位置不会被掩码
+            if valid_mask is not None:
+                mask = mask & valid_mask[i]
         
         else:
             raise ValueError(f"Unknown masking strategy: {strategy}")
