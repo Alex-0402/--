@@ -13,18 +13,40 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     echo "示例(稳定模式): bash run_8gpu.sh"
     echo "示例(调试模式): bash run_8gpu.sh --debug_mode"
     echo "示例(附加参数): bash run_8gpu.sh --debug_mode --resume checkpoints_20000/best_model.pt"
+    echo "日志文件: 默认保存到 logs/train_8gpu_时间戳.log"
     exit 0
 fi
 
 # 参数解析：支持开关调试模式，并透传其余参数给 train.py
 DEBUG_MODE=false
 EXTRA_ARGS=()
+
+# 恢复参数处理：默认从best_model恢复；若用户显式传入--resume则不再注入默认值
+USER_PROVIDED_RESUME=false
+SKIP_NEXT=false
 for arg in "$@"; do
+    if [[ "$SKIP_NEXT" == true ]]; then
+        SKIP_NEXT=false
+        continue
+    fi
+
     if [[ "$arg" == "--debug_mode" ]]; then
         DEBUG_MODE=true
-    else
-        EXTRA_ARGS+=("$arg")
+        continue
     fi
+
+    if [[ "$arg" == "--resume" ]]; then
+        USER_PROVIDED_RESUME=true
+        SKIP_NEXT=true
+        continue
+    fi
+
+    if [[ "$arg" == --resume=* ]]; then
+        USER_PROVIDED_RESUME=true
+        continue
+    fi
+
+    EXTRA_ARGS+=("$arg")
 done
 
 DEBUG_ARG=""
@@ -46,8 +68,14 @@ sleep 2
 
 # NCCL 优化设置（train.py 内部也会设置，这里作为备用）
 export NCCL_P2P_DISABLE=1  # 禁用 P2P 防止 2080Ti 可能出现的 P2P 死锁
-export NCCL_BLOCKING_WAIT=1  # 阻塞等待，报错时提供更多信息
+export TORCH_NCCL_BLOCKING_WAIT=1  # 阻塞等待，报错时提供更多信息
 export NCCL_TIMEOUT=1800     # 30分钟超时
+
+# 默认从上次最佳模型继续训练（除非用户显式指定--resume）
+RESUME_ARG=""
+if [[ "$USER_PROVIDED_RESUME" == false ]]; then
+    RESUME_ARG="--resume checkpoints_20000/best_model.pt"
+fi
 
 # 启动命令 (nproc_per_node=8，使用所有 8 张 GPU)
 echo "启动 8 GPU DDP 训练..."
@@ -58,6 +86,13 @@ if [[ "$DEBUG_MODE" == true ]]; then
 else
     echo "模式: 稳定模式 (debug_mode=OFF)"
 fi
+echo ""
+
+# 统一日志（stdout+stderr），便于 tmux 断开后追踪训练状态
+LOG_DIR="logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/train_8gpu_$(date +%F_%H-%M-%S).log"
+echo "日志文件: $LOG_FILE"
 echo ""
 
 torchrun --nproc_per_node=8 --master_port=29506 train.py \
@@ -74,10 +109,11 @@ torchrun --nproc_per_node=8 --master_port=29506 train.py \
     --early_stopping_patience 50 \
     --early_stopping_min_delta 0.001 \
     --dropout 0.3 \
-    --save_dir checkpoints_20000 \
+    --save_dir checkpoints_20000_new \
+    # ${RESUME_ARG} \
     ${DEBUG_ARG} \
-    "${EXTRA_ARGS[@]}"
-    #--resume checkpoints/best_model.pt  # 可选：从断点继续训练
+    "${EXTRA_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
+    # --resume checkpoints/best_model.pt  # 可选：从断点继续训练
 
 echo ""
 echo "训练完成或已中断"

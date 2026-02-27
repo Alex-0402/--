@@ -111,6 +111,14 @@ def parse_args():
                        help="掩码策略")
     parser.add_argument("--num_diffusion_steps", type=int, default=1000,
                        help="扩散模型的时间步数（默认1000）")
+    parser.add_argument("--label_smoothing", type=float, default=0.1,
+                       help="交叉熵标签平滑系数（默认0.1，诊断可尝试0.0/0.05）")
+    parser.add_argument("--max_train_samples", type=int, default=0,
+                       help="仅使用前N个训练样本（0表示不限制，用于快速诊断）")
+    parser.add_argument("--max_val_samples", type=int, default=0,
+                       help="仅使用前N个验证样本（0表示不限制，用于快速诊断）")
+    parser.add_argument("--overfit_train_subset", type=int, default=0,
+                       help="容量诊断：从训练集取N个样本，并将验证集也设为同一子集（0表示关闭）")
     
     # 其他参数
     parser.add_argument("--save_dir", type=str, default="checkpoints",
@@ -248,9 +256,13 @@ def main():
             print(f"总批次大小: {args.batch_size * world_size} (所有GPU)")
         print(f"训练轮数: {args.epochs}")
         print(f"扩散模型: 启用 (时间步数: {args.num_diffusion_steps})")
+        print(f"Label smoothing: {args.label_smoothing}")
         print(f"掩码比例: 动态 (Cosine Schedule, t=0时0%, t=1时100%)")
         print(f"掩码策略: {args.masking_strategy}")
         print("="*70)
+
+    if not (0.0 <= args.label_smoothing <= 1.0):
+        raise ValueError("--label_smoothing 必须在 [0, 1] 范围内")
     
     # 加载数据集
     if rank == 0:
@@ -349,6 +361,26 @@ def main():
                 augment=True  # 训练时启用数据增强
             )
             val_dataset = None
+
+    # 诊断选项：限制样本数量（快速实验）
+    if args.max_train_samples > 0 and len(train_dataset) > args.max_train_samples:
+        train_dataset = torch.utils.data.Subset(train_dataset, list(range(args.max_train_samples)))
+        if rank == 0:
+            print(f"   🔬 训练集已截断为: {len(train_dataset)} 个样本")
+
+    if val_dataset is not None and args.max_val_samples > 0 and len(val_dataset) > args.max_val_samples:
+        val_dataset = torch.utils.data.Subset(val_dataset, list(range(args.max_val_samples)))
+        if rank == 0:
+            print(f"   🔬 验证集已截断为: {len(val_dataset)} 个样本")
+
+    # 容量诊断：让模型在小训练子集上过拟合，验证是否具备表达能力
+    if args.overfit_train_subset > 0:
+        overfit_n = min(args.overfit_train_subset, len(train_dataset))
+        overfit_indices = list(range(overfit_n))
+        train_dataset = torch.utils.data.Subset(train_dataset, overfit_indices)
+        val_dataset = torch.utils.data.Subset(train_dataset, list(range(overfit_n)))
+        if rank == 0:
+            print(f"   🧪 过拟合诊断模式: train=val={overfit_n} 个样本")
     
     # 创建数据加载器
     # DDP 模式：使用 DistributedSampler
@@ -466,13 +498,15 @@ def main():
             encoder,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False  # 如果所有参数都被使用，设为 False 可以提升性能
+            find_unused_parameters=False,  # 如果所有参数都被使用，设为 False 可以提升性能
+            broadcast_buffers=False  # 模型未使用BatchNorm，关闭前向buffer同步可降低死锁风险
         )
         decoder = torch.nn.parallel.DistributedDataParallel(
             decoder,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False
+            find_unused_parameters=False,
+            broadcast_buffers=False
         )
         if rank == 0:
             print(f"   ✅ 模型已包装为 DDP (device_id={local_rank})")
@@ -497,7 +531,8 @@ def main():
         world_size=world_size,
         train_sampler=train_sampler,
         val_sampler=val_sampler,
-        debug_mode=args.debug_mode
+        debug_mode=args.debug_mode,
+        label_smoothing=args.label_smoothing
     )
     
     # 开始训练

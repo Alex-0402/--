@@ -6,6 +6,7 @@
 
 import os
 import sys
+import argparse
 import torch
 from tqdm import tqdm
 
@@ -15,9 +16,44 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data.dataset import ProteinStructureDataset
 from data.vocabulary import get_vocab
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="根据现有划分文件重新生成缓存")
+    parser.add_argument("--cache_dir", type=str, default="data/cache",
+                        help="缓存目录，需包含 train.txt / val.txt（可选 test.txt）")
+    parser.add_argument("--raw_data_dir", type=str, default="raw_data",
+                        help="原始结构文件目录（包含 .pdb/.cif）")
+    parser.add_argument("--clear_old", action="store_true",
+                        help="先删除 cache_dir 下旧的 .pt 缓存")
+    parser.add_argument("--use_test_split", action="store_true",
+                        help="同时读取并重建 test.txt 中的样本")
+    return parser.parse_args()
+
+
+def _find_structure_file(raw_data_dir: str, file_name: str):
+    """按文件名在 raw_data_dir 里查找 .pdb/.cif（支持一级与递归）。"""
+    candidates = [
+        os.path.join(raw_data_dir, f"{file_name}.pdb"),
+        os.path.join(raw_data_dir, f"{file_name}.cif"),
+        os.path.join(raw_data_dir, f"{file_name}.PDB"),
+        os.path.join(raw_data_dir, f"{file_name}.CIF"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    # 递归兜底
+    for root, _, files in os.walk(raw_data_dir):
+        for ext in (".pdb", ".cif", ".PDB", ".CIF"):
+            target = f"{file_name}{ext}"
+            if target in files:
+                return os.path.join(root, target)
+    return None
+
+
 def main():
-    cache_dir = "data/cache"
-    raw_data_dir = "raw_data"
+    args = parse_args()
+    cache_dir = args.cache_dir
+    raw_data_dir = args.raw_data_dir
     
     # 检查目录
     if not os.path.exists(cache_dir):
@@ -31,6 +67,7 @@ def main():
     # 检查划分文件
     train_file = os.path.join(cache_dir, "train.txt")
     val_file = os.path.join(cache_dir, "val.txt")
+    test_file = os.path.join(cache_dir, "test.txt")
     
     if not os.path.exists(train_file) or not os.path.exists(val_file):
         print("❌ 未找到 train.txt 或 val.txt")
@@ -42,20 +79,30 @@ def main():
         train_files = [line.strip() for line in f if line.strip()]
     with open(val_file, 'r') as f:
         val_files = [line.strip() for line in f if line.strip()]
-    
-    all_files = train_files + val_files
+
+    test_files = []
+    if args.use_test_split and os.path.exists(test_file):
+        with open(test_file, 'r') as f:
+            test_files = [line.strip() for line in f if line.strip()]
+
+    all_files = train_files + val_files + test_files
     print(f"找到 {len(train_files)} 个训练文件，{len(val_files)} 个验证文件")
+    if args.use_test_split:
+        print(f"找到 {len(test_files)} 个测试文件")
     print(f"总共需要重新生成 {len(all_files)} 个缓存文件")
     
     # 删除旧的 .pt 文件
-    print("\n1. 删除旧的缓存文件...")
-    pt_files = [f for f in os.listdir(cache_dir) if f.endswith('.pt')]
-    deleted_count = 0
-    for pt_file in pt_files:
-        pt_path = os.path.join(cache_dir, pt_file)
-        os.remove(pt_path)
-        deleted_count += 1
-    print(f"   ✅ 已删除 {deleted_count} 个旧缓存文件")
+    if args.clear_old:
+        print("\n1. 删除旧的缓存文件...")
+        pt_files = [f for f in os.listdir(cache_dir) if f.endswith('.pt')]
+        deleted_count = 0
+        for pt_file in pt_files:
+            pt_path = os.path.join(cache_dir, pt_file)
+            os.remove(pt_path)
+            deleted_count += 1
+        print(f"   ✅ 已删除 {deleted_count} 个旧缓存文件")
+    else:
+        print("\n1. 跳过删除旧缓存（未指定 --clear_old）")
     
     # 重新生成缓存
     print("\n2. 重新生成缓存文件（使用更新后的 vocabulary）...")
@@ -66,13 +113,8 @@ def main():
     failed_count = 0
     
     for file_name in tqdm(all_files, desc="处理进度"):
-        # 查找对应的 PDB 文件
-        pdb_path = None
-        for ext in ['.pdb', '.cif']:
-            potential_path = os.path.join(raw_data_dir, f"{file_name}{ext}")
-            if os.path.exists(potential_path):
-                pdb_path = potential_path
-                break
+        # 查找对应的 PDB/mmCIF 文件
+        pdb_path = _find_structure_file(raw_data_dir, file_name)
         
         if pdb_path is None:
             print(f"\n   ⚠️  警告: 找不到文件 {file_name}.pdb 或 {file_name}.cif")
@@ -112,7 +154,7 @@ def main():
     print("缓存重新生成完成！")
     print("="*70)
     print("\n下一步: 可以开始训练了")
-    print("  bash 重新开始训练.sh")
+    print("  bash run_8gpu.sh --debug_mode")
 
 if __name__ == "__main__":
     main()

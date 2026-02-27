@@ -1,0 +1,12 @@
+# 重新生成缓存
+python 根据现有划分重新生成缓存.py --cache_dir data/cache_20000 --raw_data_dir raw_data --clear_old --use_test_split
+
+# 建立tmux进行训练
+tmux new -A -s protein_train
+cd /home/Oliver-0402/--/protein_mdm
+bash run_8gpu.sh --debug_mode   
+Ctrl+b 再按 d 分离
+
+# 重连tmux
+tmux attach -t protein_train
+

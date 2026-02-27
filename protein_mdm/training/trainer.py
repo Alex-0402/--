@@ -68,7 +68,8 @@ class Trainer:
         world_size: int = 1,
         train_sampler: Optional[object] = None,
         val_sampler: Optional[object] = None,
-        debug_mode: bool = False
+        debug_mode: bool = False,
+        label_smoothing: float = 0.1
     ):
         """
         初始化训练器
@@ -91,6 +92,7 @@ class Trainer:
             train_sampler: 训练集的 DistributedSampler（DDP 模式）
             val_sampler: 验证集的 DistributedSampler（DDP 模式）
             debug_mode: 是否启用详细调试日志（默认False）
+            label_smoothing: 交叉熵标签平滑系数（默认0.1）
         """
         self.encoder = encoder
         self.decoder = decoder
@@ -112,6 +114,7 @@ class Trainer:
         self.train_sampler = train_sampler
         self.val_sampler = val_sampler
         self.debug_mode = debug_mode
+        self.label_smoothing = float(max(0.0, min(1.0, label_smoothing)))
         
         # 优化器
         self.optimizer = optim.AdamW(
@@ -184,7 +187,7 @@ class Trainer:
                         fragment_loss = nn.functional.cross_entropy(
                             masked_logits.view(-1, fragment_logits.shape[-1]),
                             masked_targets.view(-1),
-                            label_smoothing=0.1
+                            label_smoothing=self.label_smoothing
                         )
                         # 检查结果是否为 NaN
                         if torch.isnan(fragment_loss) or torch.isinf(fragment_loss):
@@ -206,7 +209,7 @@ class Trainer:
                     fragment_loss = nn.functional.cross_entropy(
                         masked_logits.reshape(-1, fragment_logits.shape[-1]),
                         masked_targets.reshape(-1),
-                        label_smoothing=0.1
+                        label_smoothing=self.label_smoothing
                     )
                     # 检查结果是否为 NaN
                     if torch.isnan(fragment_loss) or torch.isinf(fragment_loss):
@@ -257,7 +260,7 @@ class Trainer:
                         torsion_loss = nn.functional.cross_entropy(
                             torsion_logits_valid.reshape(-1, num_bins),
                             torsion_targets_valid.reshape(-1),
-                            label_smoothing=0.1
+                            label_smoothing=self.label_smoothing
                         )
                         if torch.isnan(torsion_loss) or torch.isinf(torsion_loss):
                             torsion_loss = torch.tensor(0.0, device=torsion_logits.device)
@@ -278,7 +281,7 @@ class Trainer:
                         torsion_loss = nn.functional.cross_entropy(
                             torsion_logits_valid.reshape(-1, num_bins),
                             torsion_targets_valid.reshape(-1),
-                            label_smoothing=0.1
+                            label_smoothing=self.label_smoothing
                         )
                         # 检查结果是否为 NaN
                         if torch.isnan(torsion_loss) or torch.isinf(torsion_loss):
@@ -290,31 +293,62 @@ class Trainer:
             # 如果没有有效的扭转角，损失为 0
             torsion_loss = torch.tensor(0.0, device=torsion_logits.device)
         
-        # 3. 物理约束Loss：扭转角平滑性约束
-        # ⚠️ 已禁用：由于输入是扁平化的片段序列（flattened fragment sequence），
-        # 相邻的 Token 可能属于完全不同的残基（例如 Token i 是残基 A 的末端，
-        # Token i+1 是残基 B 的开头）。因此，强迫它们之间角度连续是错误的物理假设。
-        # 
-        # 原始实现（已注释）：
-        # if torsion_logits.shape[1] > 1:
-        #     # 获取预测的扭转角（使用argmax或期望值）
-        #     # 为了可微，我们使用softmax后的期望值
-        #     torsion_probs = torch.softmax(torsion_logits, dim=-1)  # [batch_size, M, num_bins]
-        #     num_bins = torsion_logits.shape[-1]
-        #     # 将bin索引转换为角度（弧度）
-        #     bin_centers = torch.linspace(0, 2 * np.pi, num_bins, device=torsion_logits.device)
-        #     # 计算期望角度
-        #     expected_angles = torch.sum(torsion_probs * bin_centers.unsqueeze(0).unsqueeze(0), dim=-1)  # [batch_size, M]
-        #     
-        #     # 计算相邻角度之间的差异
-        #     angle_diff = expected_angles[:, 1:] - expected_angles[:, :-1]  # [batch_size, M-1]
-        #     # 将角度差归一化到 [-π, π] 范围
-        #     angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
-        #     # 平滑性约束：惩罚大的角度变化（L2正则化）
-        #     structure_loss = torch.mean(angle_diff ** 2)
-        
-        # 保持返回字典结构不变，返回 0.0
+        # 3. 物理约束Loss：圆周几何一致性（预测分布 vs 真实扭转角）
+        # 说明：不再对相邻 token 施加错误的“平滑”假设，而是直接约束
+        # 预测扭转角分布的圆周期望角与 torsion_raw 在圆周空间的一致性。
         structure_loss = torch.tensor(0.0, device=fragment_logits.device)
+        if torsion_raw is not None and torsion_logits is not None:
+            try:
+                batch_size, frag_seq_len, num_bins = torsion_logits.shape
+
+                if torsion_raw.dim() == 1:
+                    torsion_raw = torsion_raw.view(batch_size, -1)
+                if torsion_targets.dim() == 1:
+                    torsion_targets = torsion_targets.view(batch_size, -1)
+
+                min_len = min(frag_seq_len, torsion_raw.shape[1], torsion_targets.shape[1])
+                if min_len > 0:
+                    torsion_logits_trimmed = torsion_logits[:, :min_len, :]  # [B, T, K]
+                    torsion_raw_trimmed = torsion_raw[:, :min_len]  # [B, T]
+                    torsion_targets_trimmed = torsion_targets[:, :min_len]  # [B, T]
+
+                    if torsion_valid_mask is not None:
+                        valid_mask = torsion_valid_mask[:, :min_len]
+                    else:
+                        valid_mask = torch.ones_like(torsion_targets_trimmed, dtype=torch.bool)
+
+                    valid_mask = (
+                        valid_mask
+                        & (torsion_targets_trimmed >= 0)
+                        & (torsion_targets_trimmed < num_bins)
+                    )
+
+                    if valid_mask.any():
+                        probs = torch.softmax(torsion_logits_trimmed, dim=-1)  # [B, T, K]
+                        bin_width = 2.0 * np.pi / num_bins
+                        bin_centers = (
+                            (torch.arange(num_bins, device=torsion_logits.device, dtype=torch.float32) + 0.5)
+                            * bin_width - np.pi
+                        )  # [K]
+
+                        sin_expect = torch.sum(probs * torch.sin(bin_centers).view(1, 1, -1), dim=-1)  # [B, T]
+                        cos_expect = torch.sum(probs * torch.cos(bin_centers).view(1, 1, -1), dim=-1)  # [B, T]
+                        expected_angles = torch.atan2(sin_expect, cos_expect)  # [B, T]
+
+                        circular_diff = torch.atan2(
+                            torch.sin(expected_angles - torsion_raw_trimmed),
+                            torch.cos(expected_angles - torsion_raw_trimmed),
+                        )
+                        loss_per_pos = circular_diff ** 2
+
+                        valid_float = valid_mask.float()
+                        denom = valid_float.sum().clamp(min=1.0)
+                        structure_loss = (loss_per_pos * valid_float).sum() / denom
+
+                        if torch.isnan(structure_loss) or torch.isinf(structure_loss):
+                            structure_loss = torch.tensor(0.0, device=fragment_logits.device)
+            except Exception:
+                structure_loss = torch.tensor(0.0, device=fragment_logits.device)
         
         # 4. Offset Loss：真实的回归损失（Regression Loss）
         # 计算预测的 offset 与真实 offset 之间的 MSE Loss
@@ -419,6 +453,22 @@ class Trainer:
             else:
                 offset_loss = torch.tensor(0.0, device=fragment_logits.device)
         
+        # DDP 安全防护：当某个分支在当前 batch 没有有效监督时，
+        # 上面可能返回“纯常数 0.0”损失，导致对应参数无梯度，触发
+        # "Expected to have finished reduction..." 错误。
+        # 这里将零损失与对应 logits 建立零系数连接，保证每轮都有参数参与反传。
+        if not fragment_loss.requires_grad:
+            fragment_loss = fragment_loss + fragment_logits.sum() * 0.0
+        if not torsion_loss.requires_grad:
+            torsion_loss = torsion_loss + torsion_logits.sum() * 0.0
+        if not structure_loss.requires_grad:
+            structure_loss = structure_loss + torsion_logits.sum() * 0.0
+        if not offset_loss.requires_grad:
+            if offset_logits is not None:
+                offset_loss = offset_loss + offset_logits.sum() * 0.0
+            else:
+                offset_loss = offset_loss + torsion_logits.sum() * 0.0
+
         # 总损失（加权组合，缓解 Torsion Loss 过拟合）
         # - fragment_loss: 权重 1.0（主要损失）
         # - torsion_loss: 权重 0.5（降低权重，缓解过拟合）
@@ -449,11 +499,6 @@ class Trainer:
         if self.ddp_enabled and self.train_sampler is not None:
             self.train_sampler.set_epoch(epoch)
         
-        # DDP 模式：在创建 DataLoader 迭代器之前使用 barrier 同步所有进程
-        # 这确保所有进程在开始数据加载前都已准备好，避免 Rank 0 加载数据时其他进程等待
-        if self.ddp_enabled:
-            dist.barrier()
-        
         self.encoder.train()
         self.decoder.train()
         
@@ -479,10 +524,13 @@ class Trainer:
                 sequence_lengths = batch['sequence_lengths'].to(self.device)
                 fragment_lengths = batch.get('fragment_lengths', None)
                 torsion_lengths = batch.get('torsion_lengths', None)
+                torsion_valid_mask = batch.get('torsion_valid_mask', None)
                 if fragment_lengths is not None:
                     fragment_lengths = fragment_lengths.to(self.device)
                 if torsion_lengths is not None:
                     torsion_lengths = torsion_lengths.to(self.device)
+                if torsion_valid_mask is not None:
+                    torsion_valid_mask = torsion_valid_mask.to(self.device)
 
                 # 有效位置掩码（避免 padding 污染监督信号）
                 if fragment_lengths is not None:
@@ -492,12 +540,16 @@ class Trainer:
                 else:
                     fragment_valid_mask = fragment_token_ids != int(SpecialTokens.PAD)
 
-                if torsion_lengths is not None:
-                    torsion_valid_mask = torch.arange(
-                        torsion_bins.shape[1], device=self.device
-                    ).unsqueeze(0) < torsion_lengths.unsqueeze(1)
-                else:
-                    torsion_valid_mask = torch.ones_like(torsion_bins, dtype=torch.bool)
+                # torsion 有效位置掩码：
+                # 1) 优先使用数据集提供的精确掩码（新格式）
+                # 2) 回退到旧逻辑（按长度左对齐）以兼容旧缓存
+                if torsion_valid_mask is None:
+                    if torsion_lengths is not None:
+                        torsion_valid_mask = torch.arange(
+                            torsion_bins.shape[1], device=self.device
+                        ).unsqueeze(0) < torsion_lengths.unsqueeze(1)
+                    else:
+                        torsion_valid_mask = torch.ones_like(torsion_bins, dtype=torch.bool)
                 
                 # 创建掩码（离散扩散模式：采样时间步）
                 # 为每个样本随机采样时间步 t ∈ [1, T]（归一化到 [0, 1]）
@@ -549,11 +601,23 @@ class Trainer:
                     torsion_raw=torsion_raw
                 )
                 
-                # 检查损失是否为 NaN 或 Inf
-                if torch.isnan(losses['total_loss']) or torch.isinf(losses['total_loss']):
+                # 检查损失是否为 NaN/Inf（DDP 下必须全局一致地跳过，避免 rank 间步数不一致）
+                local_invalid = bool(torch.isnan(losses['total_loss']) or torch.isinf(losses['total_loss']))
+                if self.ddp_enabled:
+                    invalid_tensor = torch.tensor(
+                        [1 if local_invalid else 0],
+                        device=self.device,
+                        dtype=torch.int
+                    )
+                    dist.all_reduce(invalid_tensor, op=dist.ReduceOp.MAX)
+                    global_invalid = int(invalid_tensor.item()) == 1
+                else:
+                    global_invalid = local_invalid
+
+                if global_invalid:
                     if self.rank == 0:
-                        print(f"  ⚠️  警告: 训练批次 {num_batches} 的损失为 NaN/Inf，跳过")
-                    self.optimizer.zero_grad()  # 清除梯度
+                        print(f"  ⚠️  警告: 训练批次 {batch_idx} 存在 NaN/Inf，已全局同步跳过")
+                    self.optimizer.zero_grad()
                     continue
                 
                 # 反向传播
@@ -594,35 +658,29 @@ class Trainer:
                     traceback.print_exc()
             raise
         
-        # DDP 模式：在 epoch 结束时使用 barrier 同步所有进程
-        if self.ddp_enabled:
-            dist.barrier()
-        
         # DDP 模式：聚合所有进程的损失
-        if self.ddp_enabled and num_batches > 0:
-            # 创建张量用于 all_reduce
-            loss_tensor = torch.tensor([total_loss, num_batches], device=self.device, dtype=torch.float32)
-            frag_loss_tensor = torch.tensor([total_fragment_loss], device=self.device, dtype=torch.float32)
-            tors_loss_tensor = torch.tensor([total_torsion_loss], device=self.device, dtype=torch.float32)
-            struct_loss_tensor = torch.tensor([total_structure_loss], device=self.device, dtype=torch.float32)
-            offset_loss_tensor = torch.tensor([total_offset_loss], device=self.device, dtype=torch.float32)
-            
-            # 聚合所有进程的损失
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(frag_loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(tors_loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(struct_loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(offset_loss_tensor, op=dist.ReduceOp.SUM)
-            
-            # 计算全局平均值
-            total_loss = loss_tensor[0].item()
-            total_num_batches = int(loss_tensor[1].item())
-            total_fragment_loss = frag_loss_tensor.item()
-            total_torsion_loss = tors_loss_tensor.item()
-            total_structure_loss = struct_loss_tensor.item()
-            total_offset_loss = offset_loss_tensor.item()
-            
-            num_batches = total_num_batches
+        # 关键：所有 rank 必须无条件参与 all_reduce，避免 collective 不对齐导致死锁
+        if self.ddp_enabled:
+            stats_tensor = torch.tensor(
+                [
+                    total_loss,
+                    total_fragment_loss,
+                    total_torsion_loss,
+                    total_structure_loss,
+                    total_offset_loss,
+                    float(num_batches)
+                ],
+                device=self.device,
+                dtype=torch.float32
+            )
+            dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+
+            total_loss = stats_tensor[0].item()
+            total_fragment_loss = stats_tensor[1].item()
+            total_torsion_loss = stats_tensor[2].item()
+            total_structure_loss = stats_tensor[3].item()
+            total_offset_loss = stats_tensor[4].item()
+            num_batches = int(stats_tensor[5].item())
         
         return {
             'loss': total_loss / num_batches if num_batches > 0 else 0.0,
@@ -644,10 +702,6 @@ class Trainer:
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
-        # DDP 模式：在验证开始前同步所有进程
-        if self.ddp_enabled:
-            dist.barrier()
         
         self.encoder.eval()
         self.decoder.eval()
@@ -677,10 +731,13 @@ class Trainer:
                     sequence_lengths = batch['sequence_lengths'].to(self.device)
                     fragment_lengths = batch.get('fragment_lengths', None)
                     torsion_lengths = batch.get('torsion_lengths', None)
+                    torsion_valid_mask = batch.get('torsion_valid_mask', None)
                     if fragment_lengths is not None:
                         fragment_lengths = fragment_lengths.to(self.device)
                     if torsion_lengths is not None:
                         torsion_lengths = torsion_lengths.to(self.device)
+                    if torsion_valid_mask is not None:
+                        torsion_valid_mask = torsion_valid_mask.to(self.device)
 
                     # 有效位置掩码（避免 padding 污染监督信号）
                     if fragment_lengths is not None:
@@ -690,12 +747,16 @@ class Trainer:
                     else:
                         fragment_valid_mask = fragment_token_ids != int(SpecialTokens.PAD)
 
-                    if torsion_lengths is not None:
-                        torsion_valid_mask = torch.arange(
-                            torsion_bins.shape[1], device=self.device
-                        ).unsqueeze(0) < torsion_lengths.unsqueeze(1)
-                    else:
-                        torsion_valid_mask = torch.ones_like(torsion_bins, dtype=torch.bool)
+                    # torsion 有效位置掩码：
+                    # 1) 优先使用数据集提供的精确掩码（新格式）
+                    # 2) 回退到旧逻辑（按长度左对齐）以兼容旧缓存
+                    if torsion_valid_mask is None:
+                        if torsion_lengths is not None:
+                            torsion_valid_mask = torch.arange(
+                                torsion_bins.shape[1], device=self.device
+                            ).unsqueeze(0) < torsion_lengths.unsqueeze(1)
+                        else:
+                            torsion_valid_mask = torch.ones_like(torsion_bins, dtype=torch.bool)
                     
                     # 检查输入数据
                     if torch.isnan(backbone_coords).any() or torch.isinf(backbone_coords).any():
@@ -805,30 +866,28 @@ class Trainer:
                     continue
         
         # DDP 模式：聚合所有进程的验证损失
-        if self.ddp_enabled and num_batches > 0:
-            # 创建张量用于 all_reduce
-            loss_tensor = torch.tensor([total_loss, num_batches], device=self.device, dtype=torch.float32)
-            frag_loss_tensor = torch.tensor([total_fragment_loss], device=self.device, dtype=torch.float32)
-            tors_loss_tensor = torch.tensor([total_torsion_loss], device=self.device, dtype=torch.float32)
-            struct_loss_tensor = torch.tensor([total_structure_loss], device=self.device, dtype=torch.float32)
-            offset_loss_tensor = torch.tensor([total_offset_loss], device=self.device, dtype=torch.float32)
-            
-            # 聚合所有进程的损失
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(frag_loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(tors_loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(struct_loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(offset_loss_tensor, op=dist.ReduceOp.SUM)
-            
-            # 计算全局平均值
-            total_loss = loss_tensor[0].item()
-            total_num_batches = int(loss_tensor[1].item())
-            total_fragment_loss = frag_loss_tensor.item()
-            total_torsion_loss = tors_loss_tensor.item()
-            total_structure_loss = struct_loss_tensor.item()
-            total_offset_loss = offset_loss_tensor.item()
-            
-            num_batches = total_num_batches
+        # 关键：所有 rank 必须无条件参与 all_reduce，避免 collective 不对齐导致死锁
+        if self.ddp_enabled:
+            stats_tensor = torch.tensor(
+                [
+                    total_loss,
+                    total_fragment_loss,
+                    total_torsion_loss,
+                    total_structure_loss,
+                    total_offset_loss,
+                    float(num_batches)
+                ],
+                device=self.device,
+                dtype=torch.float32
+            )
+            dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+
+            total_loss = stats_tensor[0].item()
+            total_fragment_loss = stats_tensor[1].item()
+            total_torsion_loss = stats_tensor[2].item()
+            total_structure_loss = stats_tensor[3].item()
+            total_offset_loss = stats_tensor[4].item()
+            num_batches = int(stats_tensor[5].item())
         
         # 如果没有批次，返回空字典
         if num_batches == 0:
@@ -923,6 +982,8 @@ class Trainer:
                 print(f"恢复训练: 从 epoch {start_epoch} 继续，目标 {num_epochs} epochs")
         
         for epoch in range(start_epoch, num_epochs + 1):
+            should_stop = False
+
             # 强制清理内存和显存，防止内存泄漏
             import gc
             gc.collect()
@@ -973,31 +1034,29 @@ class Trainer:
                             )
                             print(f"✅ 保存最佳模型 (val_loss: {val_metrics['loss']:.4f})")
                     
-                    # 早停检查（只在 rank 0 打印）
+                    # 早停检查（仅由 rank 0 决策）
                     if early_stopping_patience is not None:
-                        # 检查是否有显著改进（超过min_delta）
-                        improvement = best_val_loss_for_patience - val_metrics['loss']
-                        if improvement > early_stopping_min_delta:
-                            # 有显著改进，重置计数器
-                            best_val_loss_for_patience = val_metrics['loss']
-                            patience_counter = 0
-                            if self.rank == 0:
+                        if self.rank == 0:
+                            # 检查是否有显著改进（超过 min_delta）
+                            improvement = best_val_loss_for_patience - val_metrics['loss']
+                            if improvement > early_stopping_min_delta:
+                                # 有显著改进，重置计数器
+                                best_val_loss_for_patience = val_metrics['loss']
+                                patience_counter = 0
                                 print(f"   早停计数器重置 (改进: {improvement:.6f})")
-                        else:
-                            # 没有显著改进，增加计数器
-                            patience_counter += 1
-                            if self.rank == 0:
+                            else:
+                                # 没有显著改进，增加计数器
+                                patience_counter += 1
                                 print(f"   早停计数器: {patience_counter}/{early_stopping_patience} (改进: {improvement:.6f})")
-                            
-                            # 如果达到耐心值，停止训练
-                            if patience_counter >= early_stopping_patience:
-                                if self.rank == 0:
+
+                                # 如果达到耐心值，触发停止（由 rank 0 决策，稍后广播）
+                                if patience_counter >= early_stopping_patience:
                                     print(f"\n{'='*60}")
                                     print(f"⚠️  早停触发: 验证损失连续 {early_stopping_patience} 轮未改进")
                                     print(f"   最佳验证损失: {best_val_loss_for_patience:.4f} (Epoch {epoch - patience_counter})")
                                     print(f"   当前验证损失: {val_metrics['loss']:.4f}")
                                     print(f"{'='*60}\n")
-                                break
+                                    should_stop = True
                 else:
                     if self.rank == 0:
                         print("⚠️  验证集为空，跳过验证")
@@ -1024,9 +1083,18 @@ class Trainer:
                 if epoch == 1 and self.rank == 0:
                     print("   ⚠️  可视化已请求但 matplotlib 未安装，跳过绘图")
             
-            # DDP 模式：在每个 epoch 结束时添加 barrier，确保所有卡都同步
+            # DDP 模式：由 rank 0 统一决策是否停止，并广播到所有 rank
             if self.ddp_enabled:
-                dist.barrier()
+                stop_tensor = torch.tensor(
+                    [1 if (self.rank == 0 and should_stop) else 0],
+                    dtype=torch.int,
+                    device=self.device
+                )
+                dist.broadcast(stop_tensor, src=0)
+                if int(stop_tensor.item()) == 1:
+                    break
+            elif should_stop:
+                break
         
         # 训练结束后生成最终可视化（只在 rank 0 执行）
         if visualize and VISUALIZATION_AVAILABLE and save_dir and self.rank == 0:
@@ -1123,6 +1191,9 @@ class Trainer:
         Returns:
             下一个epoch编号（从checkpoint的epoch+1开始）
         """
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"检查点不存在: {path}")
+
         checkpoint = torch.load(path, map_location=self.device)
         
         # 加载模型权重
@@ -1142,13 +1213,38 @@ class Trainer:
         encoder_state_dict = remove_module_prefix(encoder_state_dict)
         decoder_state_dict = remove_module_prefix(decoder_state_dict)
         
-        # 使用strict=False允许部分加载（如果架构有变化）
-        self.encoder.load_state_dict(encoder_state_dict, strict=False)
-        self.decoder.load_state_dict(decoder_state_dict, strict=False)
+        # DDP场景下应加载到底层module，避免key前缀(module.)不一致
+        encoder_model = self.encoder.module if isinstance(self.encoder, torch.nn.parallel.DistributedDataParallel) else self.encoder
+        decoder_model = self.decoder.module if isinstance(self.decoder, torch.nn.parallel.DistributedDataParallel) else self.decoder
+
+        # 恢复训练时必须严格匹配，避免静默部分加载导致loss异常升高
+        # 这里先用strict=False收集不匹配信息，再人工判定并抛错
+        encoder_incompat = encoder_model.load_state_dict(encoder_state_dict, strict=False)
+        decoder_incompat = decoder_model.load_state_dict(decoder_state_dict, strict=False)
+
+        missing_keys = list(encoder_incompat.missing_keys) + list(decoder_incompat.missing_keys)
+        unexpected_keys = list(encoder_incompat.unexpected_keys) + list(decoder_incompat.unexpected_keys)
+        if missing_keys or unexpected_keys:
+            msg = [
+                "恢复训练失败：检查点与当前模型结构不一致（检测到参数缺失/多余）。",
+                f"missing_keys 数量: {len(missing_keys)}",
+                f"unexpected_keys 数量: {len(unexpected_keys)}"
+            ]
+            if self.rank == 0:
+                preview_missing = missing_keys[:10]
+                preview_unexpected = unexpected_keys[:10]
+                if preview_missing:
+                    msg.append(f"missing_keys 示例: {preview_missing}")
+                if preview_unexpected:
+                    msg.append(f"unexpected_keys 示例: {preview_unexpected}")
+            raise RuntimeError("\n".join(msg))
         
         # 加载优化器状态
         if 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        else:
+            if self.rank == 0:
+                print("   ⚠️  检查点不包含 optimizer_state_dict，将使用新优化器状态继续训练")
         
         # 加载学习率调度器状态
         if 'cosine_scheduler_state_dict' in checkpoint and hasattr(self, 'cosine_scheduler'):
@@ -1205,4 +1301,13 @@ class Trainer:
         
         # 返回下一个epoch编号
         current_epoch = checkpoint.get('epoch', 0)
+        self.current_epoch = int(current_epoch)
+
+        if self.rank == 0:
+            lr_values = [pg.get('lr', None) for pg in self.optimizer.param_groups]
+            lr_values = [v for v in lr_values if v is not None]
+            if lr_values:
+                print(f"   恢复后优化器学习率: {[f'{v:.3e}' for v in lr_values]}")
+            print(f"   检查点epoch: {current_epoch}, 下一epoch: {current_epoch + 1}")
+
         return current_epoch + 1

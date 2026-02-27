@@ -270,7 +270,7 @@ class ProteinStructureDataset(Dataset):
             chain = list(model.get_chains())[0]
             
             # Extract backbone coordinates and side-chain information
-            backbone_coords, fragment_tokens, torsion_angles, residue_types = \
+            backbone_coords, fragment_tokens, torsion_angles, residue_types, torsion_angles_by_residue = \
                 self._extract_structure_data(chain)
             
             # 检查是否成功提取数据
@@ -286,21 +286,41 @@ class ProteinStructureDataset(Dataset):
                 fragment_indices.extend(self.vocab.fragments_to_indices(tokens))
             fragment_tensor = torch.tensor(fragment_indices, dtype=torch.long)
             
-            # Discretize torsion angles
-            if len(torsion_angles) > 0:
-                torsion_bins = discretize_angles(np.array(torsion_angles), num_bins=72)
+            # 构建“与片段序列对齐”的 torsion 监督：长度与 fragment_token_ids 一致
+            # 策略：每个残基只在其第一个片段位置监督 chi1（若存在），其余片段位置置无效
+            aligned_torsion_raw = []
+            aligned_torsion_valid = []
+            for frags, chi1 in zip(fragment_tokens, torsion_angles_by_residue):
+                frag_n = len(frags)
+                if frag_n == 0:
+                    continue
+                if chi1 is not None:
+                    aligned_torsion_raw.append(float(chi1))
+                    aligned_torsion_valid.append(True)
+                else:
+                    aligned_torsion_raw.append(0.0)
+                    aligned_torsion_valid.append(False)
+
+                for _ in range(frag_n - 1):
+                    aligned_torsion_raw.append(0.0)
+                    aligned_torsion_valid.append(False)
+
+            if len(aligned_torsion_raw) > 0:
+                torsion_bins = discretize_angles(np.array(aligned_torsion_raw), num_bins=72)
                 torsion_tensor = torch.tensor(torsion_bins, dtype=torch.long)
-                # 保存原始的浮点角度值（弧度），用于回归损失计算
-                torsion_raw_tensor = torch.tensor(torsion_angles, dtype=torch.float32)
+                torsion_raw_tensor = torch.tensor(aligned_torsion_raw, dtype=torch.float32)
+                torsion_valid_tensor = torch.tensor(aligned_torsion_valid, dtype=torch.bool)
             else:
                 torsion_tensor = torch.tensor([], dtype=torch.long)
                 torsion_raw_tensor = torch.tensor([], dtype=torch.float32)
+                torsion_valid_tensor = torch.tensor([], dtype=torch.bool)
             
             data = {
                 'backbone_coords': backbone_tensor,
                 'fragment_token_ids': fragment_tensor,
                 'torsion_bins': torsion_tensor,
                 'torsion_raw': torsion_raw_tensor,  # 原始浮点角度值（弧度）
+                'torsion_valid_mask': torsion_valid_tensor,
                 'residue_types': residue_types,
                 'sequence_length': torch.tensor(len(backbone_coords), dtype=torch.long),
                 'pdb_path': pdb_path
@@ -416,7 +436,7 @@ class ProteinStructureDataset(Dataset):
     def _extract_structure_data(
         self,
         chain
-    ) -> Tuple[np.ndarray, List[List[str]], List[float], List[str]]:
+    ) -> Tuple[np.ndarray, List[List[str]], List[float], List[str], List[Optional[float]]]:
         """
         Extract backbone coordinates, fragment tokens, and torsion angles from a chain.
         
@@ -433,6 +453,7 @@ class ProteinStructureDataset(Dataset):
         backbone_coords = []
         fragment_tokens = []
         torsion_angles = []
+        torsion_angles_by_residue: List[Optional[float]] = []
         residue_types = []
         
         residues = list(chain.get_residues())
@@ -472,12 +493,13 @@ class ProteinStructureDataset(Dataset):
             # For now, we extract chi angles (side-chain dihedrals) if available.
             residue_torsions = self._extract_residue_torsions(residue)
             torsion_angles.extend(residue_torsions)
+            torsion_angles_by_residue.append(float(residue_torsions[0]) if len(residue_torsions) > 0 else None)
         
         if len(backbone_coords) == 0:
-            return np.zeros((0, 4, 3)), [], [], []
+            return np.zeros((0, 4, 3)), [], [], [], []
         
         backbone_coords = np.array(backbone_coords)
-        return backbone_coords, fragment_tokens, torsion_angles, residue_types
+        return backbone_coords, fragment_tokens, torsion_angles, residue_types, torsion_angles_by_residue
     
     def _extract_residue_torsions(self, residue) -> List[float]:
         """
@@ -555,6 +577,7 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
             'fragment_token_ids': torch.zeros((0, 1), dtype=torch.long),
             'torsion_bins': torch.zeros((0, 1), dtype=torch.long),
             'torsion_raw': torch.zeros((0, 1), dtype=torch.float32),
+            'torsion_valid_mask': torch.zeros((0, 1), dtype=torch.bool),
             'sequence_lengths': torch.zeros(0, dtype=torch.long),
             'fragment_lengths': torch.zeros(0, dtype=torch.long),
             'torsion_lengths': torch.zeros(0, dtype=torch.long),
@@ -586,6 +609,10 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         (batch_size, max_torsions),
         dtype=torch.float32
     )
+    torsion_valid_batch = torch.zeros(
+        (batch_size, max_torsions),
+        dtype=torch.bool
+    )
     seq_lengths = torch.zeros(batch_size, dtype=torch.long)
     fragment_lengths = torch.zeros(batch_size, dtype=torch.long)
     torsion_lengths = torch.zeros(batch_size, dtype=torch.long)
@@ -605,6 +632,14 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         else:
             # 如果缺少 torsion_raw 字段，用 0 填充
             torsion_raw_batch[i, :tors_len] = 0
+
+        # 优先使用样本提供的有效掩码（新格式）；旧缓存回退到“前 tors_len 全有效”
+        if tors_len > 0 and 'torsion_valid_mask' in item and item['torsion_valid_mask'] is not None:
+            valid_mask = item['torsion_valid_mask']
+            vlen = min(tors_len, int(valid_mask.shape[0]))
+            torsion_valid_batch[i, :vlen] = valid_mask[:vlen].bool()
+        else:
+            torsion_valid_batch[i, :tors_len] = True
         seq_lengths[i] = seq_len
         fragment_lengths[i] = frag_len
         torsion_lengths[i] = tors_len
@@ -614,6 +649,7 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         'fragment_token_ids': fragment_batch,
         'torsion_bins': torsion_batch,
         'torsion_raw': torsion_raw_batch,  # 原始浮点角度值（弧度）
+        'torsion_valid_mask': torsion_valid_batch,
         'sequence_lengths': seq_lengths,
         'fragment_lengths': fragment_lengths,
         'torsion_lengths': torsion_lengths,
