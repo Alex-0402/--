@@ -186,7 +186,83 @@ class FragmentVocab:
             "GLY": [],  # No side chain
             "PRO": ["METHYLENE", "METHYLENE", "METHYLENE"],  # Cyclic simplified
         }
+        
+        # Hardcoded mapping from 20 standard amino acids to fragment levels (Kinematic Tree Depth)
+        # 层级规则：从主干开始，第一连接点为 0，依此类推。用于树形拓扑掩码策略。
+        self._residue_to_fragment_levels_map: Dict[str, List[int]] = {
+            "ALA": [0],
+            "VAL": [0, 1, 1],
+            "LEU": [0, 1, 2, 2],
+            "ILE": [0, 1, 1, 2],
+            "MET": [0, 1, 2, 3],
+            "PHE": [0, 1],
+            "TYR": [0, 1, 2],
+            "TRP": [0, 1],
+            "SER": [0, 1],
+            "THR": [0, 1, 1],
+            "ASN": [0, 1],
+            "GLN": [0, 1, 2],
+            "LYS": [0, 1, 2, 3, 4],
+            "ARG": [0, 1, 2, 3],
+            "HIS": [0, 1],
+            "ASP": [0, 1],
+            "GLU": [0, 1, 2],
+            "CYS": [0, 1],
+            "GLY": [],
+            "PRO": [0, 1, 2],
+        }
+        
+        # Mapping from 20 standard amino acids to their fragment parent indices.
+        # -1 means the fragment attaches to the backbone. Otherwise, it points to the index
+        # of its parent fragment within the same residue.
+        # This fixes the topological assumption for branched amino acids (VAL, LEU, ILE, THR).
+        self._residue_to_fragment_parents_map: Dict[str, List[int]] = {
+            "ALA": [-1],
+            "VAL": [-1, 0, 0],
+            "LEU": [-1, 0, 1, 1],
+            "ILE": [-1, 0, 0, 2],
+            "MET": [-1, 0, 1, 2],
+            "PHE": [-1, 0],
+            "TYR": [-1, 0, 1],
+            "TRP": [-1, 0],
+            "SER": [-1, 0],
+            "THR": [-1, 0, 0],
+            "ASN": [-1, 0],
+            "GLN": [-1, 0, 1],
+            "LYS": [-1, 0, 1, 2, 3],
+            "ARG": [-1, 0, 1, 2],
+            "HIS": [-1, 0],
+            "ASP": [-1, 0],
+            "GLU": [-1, 0, 1],
+            "CYS": [-1, 0],
+            "GLY": [],
+            "PRO": [-1, 0, 1],
+        }
     
+    def residue_to_fragment_levels(self, res_name: str) -> List[int]:
+        """
+        Convert a residue name to its fragment token levels (Kinematic Tree Depths).
+        """
+        res_name_upper = res_name.upper()
+        if res_name_upper not in self._residue_to_fragment_levels_map:
+            raise ValueError(
+                f"Unknown residue type: {res_name}. "
+                f"Supported residues: {list(self._residue_to_fragment_levels_map.keys())}"
+            )
+        return self._residue_to_fragment_levels_map[res_name_upper].copy()
+
+    def residue_to_fragment_parents(self, res_name: str) -> List[int]:
+        """
+        Convert a residue name to its fragment token parent indices.
+        """
+        res_name_upper = res_name.upper()
+        if res_name_upper not in self._residue_to_fragment_parents_map:
+            raise ValueError(
+                f"Unknown residue type: {res_name}. "
+                f"Supported residues: {list(self._residue_to_fragment_parents_map.keys())}"
+            )
+        return self._residue_to_fragment_parents_map[res_name_upper].copy()
+
     def residue_to_fragments(self, res_name: str) -> List[str]:
         """
         Convert a residue name to its fragment token sequence.

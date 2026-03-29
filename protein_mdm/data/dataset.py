@@ -242,6 +242,96 @@ class ProteinStructureDataset(Dataset):
             # 只在主进程中打印警告，避免多进程输出混乱
             if os.getpid() == os.getppid() or not hasattr(os, 'getppid'):
                 print(f"Warning: Failed to save cache {cache_path}: {e}")
+
+    def _upgrade_cached_data(self, data: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], bool]:
+        """
+        为旧缓存补齐新字段，避免新逻辑依赖字段缺失。
+
+        兼容字段：
+        - fragment_levels
+        - fragment_residue_idx
+
+        Returns:
+            (data, upgraded)
+        """
+        upgraded = False
+
+        frag_tokens = data.get('fragment_token_ids', torch.tensor([], dtype=torch.long))
+        frag_len = int(frag_tokens.shape[0]) if isinstance(frag_tokens, torch.Tensor) else 0
+        residue_types = data.get('residue_types', [])
+
+        def _fit_length(values: List[int], target_len: int, pad_value: int = 0) -> List[int]:
+            if len(values) < target_len:
+                values = values + [pad_value] * (target_len - len(values))
+            elif len(values) > target_len:
+                values = values[:target_len]
+            return values
+
+        # 1) 补齐 fragment_levels
+        need_levels = ('fragment_levels' not in data)
+        if not need_levels:
+            levels_obj = data['fragment_levels']
+            need_levels = (not isinstance(levels_obj, torch.Tensor)) or (int(levels_obj.shape[0]) != frag_len)
+
+        if need_levels:
+            inferred_levels: List[int] = []
+            for res_name in residue_types:
+                try:
+                    inferred_levels.extend(self.vocab.residue_to_fragment_levels(res_name))
+                except Exception:
+                    # 未知残基回退：按该残基片段数补 0
+                    try:
+                        n_frag = len(self.vocab.residue_to_fragments(res_name))
+                    except Exception:
+                        n_frag = 0
+                    inferred_levels.extend([0] * n_frag)
+
+            inferred_levels = _fit_length(inferred_levels, frag_len, pad_value=0)
+            data['fragment_levels'] = torch.tensor(inferred_levels, dtype=torch.long)
+            upgraded = True
+
+        # 2) 补齐 fragment_residue_idx
+        need_res_idx = ('fragment_residue_idx' not in data)
+        if not need_res_idx:
+            ridx_obj = data['fragment_residue_idx']
+            need_res_idx = (not isinstance(ridx_obj, torch.Tensor)) or (int(ridx_obj.shape[0]) != frag_len)
+
+        if need_res_idx:
+            inferred_ridx: List[int] = []
+            for i_res, res_name in enumerate(residue_types):
+                try:
+                    n_frag = len(self.vocab.residue_to_fragments(res_name))
+                except Exception:
+                    n_frag = 0
+                inferred_ridx.extend([i_res] * n_frag)
+
+            inferred_ridx = _fit_length(inferred_ridx, frag_len, pad_value=0)
+            data['fragment_residue_idx'] = torch.tensor(inferred_ridx, dtype=torch.long)
+            upgraded = True
+
+        # 3) 补齐 fragment_parents
+        need_parents = ('fragment_parents' not in data)
+        if not need_parents:
+            parents_obj = data['fragment_parents']
+            need_parents = (not isinstance(parents_obj, torch.Tensor)) or (int(parents_obj.shape[0]) != frag_len)
+
+        if need_parents:
+            inferred_parents: List[int] = []
+            for res_name in residue_types:
+                try:
+                    inferred_parents.extend(self.vocab.residue_to_fragment_parents(res_name))
+                except Exception:
+                    try:
+                        n_frag = len(self.vocab.residue_to_fragments(res_name))
+                    except Exception:
+                        n_frag = 0
+                    inferred_parents.extend([-1] * n_frag)
+
+            inferred_parents = _fit_length(inferred_parents, frag_len, pad_value=-1)
+            data['fragment_parents'] = torch.tensor(inferred_parents, dtype=torch.long)
+            upgraded = True
+
+        return data, upgraded
     
     def _parse_pdb_file(self, pdb_path: str) -> Optional[Dict[str, torch.Tensor]]:
         """
@@ -280,11 +370,29 @@ class ProteinStructureDataset(Dataset):
             # Convert to tensors
             backbone_tensor = torch.tensor(backbone_coords, dtype=torch.float32)
             
-            # Convert fragment tokens to indices
+            # Convert fragment tokens to indices and extract hierarchical levels/parents
             fragment_indices = []
-            for tokens in fragment_tokens:
-                fragment_indices.extend(self.vocab.fragments_to_indices(tokens))
+            fragment_levels = []
+            fragment_parents = []
+            fragment_residue_idx = []
+            for i_res, (res_name, tokens) in enumerate(zip(residue_types, fragment_tokens)):
+                indices = self.vocab.fragments_to_indices(tokens)
+                fragment_indices.extend(indices)
+                fragment_residue_idx.extend([i_res] * len(indices))
+                try:
+                    levels = self.vocab.residue_to_fragment_levels(res_name)
+                    fragment_levels.extend(levels)
+                    parents = self.vocab.residue_to_fragment_parents(res_name)
+                    fragment_parents.extend(parents)
+                except ValueError:
+                    # Fallback for unknown residue types just in case
+                    fragment_levels.extend([0] * len(tokens))
+                    fragment_parents.extend([-1] * len(tokens))
+            
             fragment_tensor = torch.tensor(fragment_indices, dtype=torch.long)
+            fragment_levels_tensor = torch.tensor(fragment_levels, dtype=torch.long)
+            fragment_parents_tensor = torch.tensor(fragment_parents, dtype=torch.long)
+            fragment_residue_idx_tensor = torch.tensor(fragment_residue_idx, dtype=torch.long)
             
             # 构建“与片段序列对齐”的 torsion 监督：长度与 fragment_token_ids 一致
             # 策略：每个残基只在其第一个片段位置监督 chi1（若存在），其余片段位置置无效
@@ -318,6 +426,9 @@ class ProteinStructureDataset(Dataset):
             data = {
                 'backbone_coords': backbone_tensor,
                 'fragment_token_ids': fragment_tensor,
+                'fragment_levels': fragment_levels_tensor,
+                'fragment_parents': fragment_parents_tensor,
+                'fragment_residue_idx': fragment_residue_idx_tensor,
                 'torsion_bins': torsion_tensor,
                 'torsion_raw': torsion_raw_tensor,  # 原始浮点角度值（弧度）
                 'torsion_valid_mask': torsion_valid_tensor,
@@ -402,6 +513,9 @@ class ProteinStructureDataset(Dataset):
         if pdb_path.endswith('.pt'):
             cached_data = self._load_from_cache(pdb_path)
             if cached_data is not None:
+                cached_data, upgraded = self._upgrade_cached_data(cached_data)
+                if upgraded:
+                    self._save_to_cache(pdb_path, cached_data)
                 # 对缓存数据应用数据增强
                 return self._apply_data_augmentation(cached_data)
             else:
@@ -414,6 +528,9 @@ class ProteinStructureDataset(Dataset):
         if cache_path is not None:
             cached_data = self._load_from_cache(cache_path)
             if cached_data is not None:
+                cached_data, upgraded = self._upgrade_cached_data(cached_data)
+                if upgraded:
+                    self._save_to_cache(cache_path, cached_data)
                 # 对缓存数据应用数据增强
                 return self._apply_data_augmentation(cached_data)
         
@@ -575,6 +692,8 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         return {
             'backbone_coords': torch.zeros((0, 1, 4, 3), dtype=torch.float32),
             'fragment_token_ids': torch.zeros((0, 1), dtype=torch.long),
+            'fragment_levels': torch.zeros((0, 1), dtype=torch.long),
+            'fragment_residue_idx': torch.zeros((0, 1), dtype=torch.long),
             'torsion_bins': torch.zeros((0, 1), dtype=torch.long),
             'torsion_raw': torch.zeros((0, 1), dtype=torch.float32),
             'torsion_valid_mask': torch.zeros((0, 1), dtype=torch.bool),
@@ -598,6 +717,19 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         dtype=torch.float32
     )
     fragment_batch = torch.zeros(
+        (batch_size, max_fragments),
+        dtype=torch.long
+    )
+    fragment_levels_batch = torch.zeros(
+        (batch_size, max_fragments),
+        dtype=torch.long
+    )
+    fragment_parents_batch = torch.zeros(
+        (batch_size, max_fragments),
+        dtype=torch.long
+    )
+    fragment_parents_batch.fill_(-1)  # -1 for backbone root default
+    fragment_residue_idx_batch = torch.zeros(
         (batch_size, max_fragments),
         dtype=torch.long
     )
@@ -625,6 +757,12 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         
         backbone_batch[i, :seq_len] = item['backbone_coords']
         fragment_batch[i, :frag_len] = item['fragment_token_ids']
+        if 'fragment_levels' in item:
+            fragment_levels_batch[i, :frag_len] = item['fragment_levels']
+        if 'fragment_parents' in item:
+            fragment_parents_batch[i, :frag_len] = item['fragment_parents']
+        if 'fragment_residue_idx' in item:
+            fragment_residue_idx_batch[i, :frag_len] = item['fragment_residue_idx']
         torsion_batch[i, :tors_len] = item['torsion_bins']
         # torsion_raw 使用 0 填充（后续会被 mask 掉）
         if tors_len > 0 and 'torsion_raw' in item:
@@ -647,6 +785,9 @@ def collate_fn(batch: List[Optional[Dict[str, torch.Tensor]]]) -> Dict[str, torc
     return {
         'backbone_coords': backbone_batch,
         'fragment_token_ids': fragment_batch,
+        'fragment_levels': fragment_levels_batch,
+        'fragment_parents': fragment_parents_batch,
+        'fragment_residue_idx': fragment_residue_idx_batch,
         'torsion_bins': torsion_batch,
         'torsion_raw': torsion_raw_batch,  # 原始浮点角度值（弧度）
         'torsion_valid_mask': torsion_valid_batch,

@@ -191,7 +191,7 @@ def main():
         # 设置 NCCL 环境变量以调试和防止死锁
         os.environ.setdefault("NCCL_TIMEOUT", "1800")  # 30分钟
         os.environ["NCCL_P2P_DISABLE"] = "1"  # 禁用 P2P 防止 2080Ti 可能出现的 P2P 死锁
-        os.environ["NCCL_BLOCKING_WAIT"] = "1"  # 阻塞等待，报错时提供更多信息
+        os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"  # 阻塞等待，报错时提供更多信息
         # 可选：如果需要详细调试日志，取消下面的注释
         # os.environ.setdefault("NCCL_DEBUG", "INFO")
         
@@ -214,19 +214,35 @@ def main():
         # 如果手动启动，可以使用 init_method
         if "MASTER_ADDR" in os.environ and "MASTER_PORT" in os.environ:
             # torchrun 模式：使用环境变量自动初始化
-            dist.init_process_group(
-                backend="nccl",
-                timeout=timedelta(minutes=30)  # 30分钟超时
-            )
+            init_kwargs = {
+                "backend": "nccl",
+                "timeout": timedelta(minutes=30)
+            }
+            try:
+                dist.init_process_group(
+                    **init_kwargs,
+                    device_id=local_rank
+                )
+            except TypeError:
+                # 兼容不支持 device_id 参数的旧版 PyTorch
+                dist.init_process_group(**init_kwargs)
         else:
             # 手动模式：使用指定的 master_port
-            dist.init_process_group(
-                backend="nccl",
-                init_method=f"tcp://127.0.0.1:{args.master_port}",
-                rank=rank,
-                world_size=world_size,
-                timeout=timedelta(minutes=30)
-            )
+            init_kwargs = {
+                "backend": "nccl",
+                "init_method": f"tcp://127.0.0.1:{args.master_port}",
+                "rank": rank,
+                "world_size": world_size,
+                "timeout": timedelta(minutes=30)
+            }
+            try:
+                dist.init_process_group(
+                    **init_kwargs,
+                    device_id=local_rank
+                )
+            except TypeError:
+                # 兼容不支持 device_id 参数的旧版 PyTorch
+                dist.init_process_group(**init_kwargs)
         
         # 只在 rank 0 打印信息
         if rank == 0:
@@ -498,14 +514,14 @@ def main():
             encoder,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False,  # 如果所有参数都被使用，设为 False 可以提升性能
+            find_unused_parameters=True,  # 如果有条件分支（如跳过模型的部分模块），必须设为 True
             broadcast_buffers=False  # 模型未使用BatchNorm，关闭前向buffer同步可降低死锁风险
         )
         decoder = torch.nn.parallel.DistributedDataParallel(
             decoder,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             broadcast_buffers=False
         )
         if rank == 0:

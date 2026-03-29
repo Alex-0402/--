@@ -142,6 +142,41 @@ class Trainer:
         """仅在主进程且开启调试时打印详细日志。"""
         if self.rank == 0 and self.debug_mode:
             print(message)
+            
+    def _circular_cross_entropy(self, logits: torch.Tensor, targets: torch.Tensor, num_bins: int, label_smoothing: float) -> torch.Tensor:
+        """计算考虑周期边界的 Circular Label Smoothing Cross Entropy"""
+        if logits.numel() == 0:
+            return torch.tensor(0.0, device=logits.device)
+            
+        N = logits.shape[0]
+        device = logits.device
+        
+        # [1, num_bins]
+        indices = torch.arange(num_bins, device=device).unsqueeze(0)
+        # [N, 1]
+        targets_2d = targets.unsqueeze(1)
+        
+        # 计算圆周距离，保证 Bin 0 和 Bin 71 之间距离为 1
+        diff = torch.abs(indices - targets_2d)
+        circ_diff = torch.minimum(diff, num_bins - diff).float()
+        
+        if label_smoothing > 0.0:
+            # 引入基于高斯的环形目标概率分布，sigma控制相邻 bins 的平滑过渡范围
+            sigma = 1.5
+            smooth_probs = torch.exp(-0.5 * (circ_diff / sigma) ** 2)
+            # 归一化使得概率和为 1
+            smooth_probs = smooth_probs / smooth_probs.sum(dim=1, keepdim=True)
+            
+            # 使用真实标签占主导，剩余质量按高斯分布分配到邻近 bins
+            one_hot = (circ_diff == 0).float()
+            target_probs = one_hot * (1.0 - label_smoothing) + smooth_probs * label_smoothing
+        else:
+            target_probs = (circ_diff == 0).float()
+            
+        # 手动计算交叉熵
+        log_probs = nn.functional.log_softmax(logits, dim=-1)
+        loss = -torch.sum(target_probs * log_probs, dim=-1).mean()
+        return loss
     
     def compute_loss(
         self,
@@ -191,11 +226,11 @@ class Trainer:
                         )
                         # 检查结果是否为 NaN
                         if torch.isnan(fragment_loss) or torch.isinf(fragment_loss):
-                            fragment_loss = torch.tensor(0.0, device=fragment_logits.device)
+                            fragment_loss = fragment_logits.sum() * 0.0
                     except Exception:
-                        fragment_loss = torch.tensor(0.0, device=fragment_logits.device)
+                        fragment_loss = fragment_logits.sum() * 0.0
             else:
-                fragment_loss = torch.tensor(0.0, device=fragment_logits.device)
+                fragment_loss = fragment_logits.sum() * 0.0
         else:
             # 没有提供掩码时，只计算非 PAD 位置
             masked_logits = fragment_logits[valid_fragment_mask]
@@ -213,9 +248,9 @@ class Trainer:
                     )
                     # 检查结果是否为 NaN
                     if torch.isnan(fragment_loss) or torch.isinf(fragment_loss):
-                        fragment_loss = torch.tensor(0.0, device=fragment_logits.device)
+                        fragment_loss = fragment_logits.sum() * 0.0
                 except Exception:
-                    fragment_loss = torch.tensor(0.0, device=fragment_logits.device)
+                    fragment_loss = fragment_logits.sum() * 0.0
         
         # 扭转角损失（交叉熵）
         # 注意：torsion_targets 的长度可能小于 torsion_logits 的第二维
@@ -245,7 +280,7 @@ class Trainer:
             
             # 检查是否有无效值
             if torch.isnan(torsion_logits_trimmed).any() or torch.isinf(torsion_logits_trimmed).any():
-                torsion_loss = torch.tensor(0.0, device=torsion_logits.device)
+                torsion_loss = torsion_logits.sum() * 0.0
             elif (torsion_targets_trimmed < 0).any() or (torsion_targets_trimmed >= num_bins).any():
                 # 目标值超出有效范围，过滤掉无效值 + padding位置
                 valid_mask = (
@@ -257,9 +292,10 @@ class Trainer:
                     torsion_logits_valid = torsion_logits_trimmed[valid_mask]
                     torsion_targets_valid = torsion_targets_trimmed[valid_mask]
                     try:
-                        torsion_loss = nn.functional.cross_entropy(
+                        torsion_loss = self._circular_cross_entropy(
                             torsion_logits_valid.reshape(-1, num_bins),
                             torsion_targets_valid.reshape(-1),
+                            num_bins=num_bins,
                             label_smoothing=self.label_smoothing
                         )
                         if torch.isnan(torsion_loss) or torch.isinf(torsion_loss):
@@ -278,9 +314,10 @@ class Trainer:
                     else:
                         torsion_logits_valid = torsion_logits_trimmed[valid_mask]
                         torsion_targets_valid = torsion_targets_trimmed[valid_mask]
-                        torsion_loss = nn.functional.cross_entropy(
+                        torsion_loss = self._circular_cross_entropy(
                             torsion_logits_valid.reshape(-1, num_bins),
                             torsion_targets_valid.reshape(-1),
+                            num_bins=num_bins,
                             label_smoothing=self.label_smoothing
                         )
                         # 检查结果是否为 NaN
@@ -474,6 +511,14 @@ class Trainer:
         # - torsion_loss: 权重 0.5（降低权重，缓解过拟合）
         # - structure_loss: 权重 0.1（平滑性约束）
         # - offset_loss: 权重 1.0（正则化）
+        
+        # 兜底防护：防止异常 PDB 数据污染图导致 NaN 分层崩溃
+        if torch.isnan(fragment_loss) or torch.isnan(torsion_loss) or torch.isnan(structure_loss):
+            fragment_loss = torch.nan_to_num(fragment_loss, nan=0.0)
+            torsion_loss = torch.nan_to_num(torsion_loss, nan=0.0)
+            structure_loss = torch.nan_to_num(structure_loss, nan=0.0)
+            offset_loss = torch.nan_to_num(offset_loss, nan=0.0)
+            
         total_loss = fragment_loss + 0.5 * torsion_loss + 0.1 * structure_loss + offset_loss
         
         return {
@@ -531,6 +576,18 @@ class Trainer:
                     torsion_lengths = torsion_lengths.to(self.device)
                 if torsion_valid_mask is not None:
                     torsion_valid_mask = torsion_valid_mask.to(self.device)
+                
+                fragment_levels = batch.get('fragment_levels', None)
+                if fragment_levels is not None:
+                    fragment_levels = fragment_levels.to(self.device)
+                
+                fragment_parents = batch.get('fragment_parents', None)
+                if fragment_parents is not None:
+                    fragment_parents = fragment_parents.to(self.device)
+                
+                fragment_residue_idx = batch.get('fragment_residue_idx', None)
+                if fragment_residue_idx is not None:
+                    fragment_residue_idx = fragment_residue_idx.to(self.device)
 
                 # 有效位置掩码（避免 padding 污染监督信号）
                 if fragment_lengths is not None:
@@ -571,7 +628,9 @@ class Trainer:
                     strategy=self.masking_strategy,
                     timesteps=timesteps,
                     valid_mask=fragment_valid_mask,
-                    use_cosine_schedule=True
+                    use_cosine_schedule=True,
+                    fragment_levels=fragment_levels,
+                    fragment_parents=fragment_parents
                 )
                 
                 # 应用掩码
@@ -588,7 +647,10 @@ class Trainer:
                 frag_logits, tors_logits, offset_logits = self.decoder(
                     node_embeddings=node_embeddings,
                     target_fragments=masked_fragments,
-                    sequence_lengths=sequence_lengths
+                    fragment_mask=fragment_masks,
+                    sequence_lengths=sequence_lengths,
+                    backbone_coords=backbone_coords,
+                    fragment_residue_idx=fragment_residue_idx
                 )
                 
                 # 计算损失（传入 offset_logits 和 torsion_raw 以计算真实的回归损失）
@@ -738,6 +800,18 @@ class Trainer:
                         torsion_lengths = torsion_lengths.to(self.device)
                     if torsion_valid_mask is not None:
                         torsion_valid_mask = torsion_valid_mask.to(self.device)
+                        
+                    fragment_levels = batch.get('fragment_levels', None)
+                    if fragment_levels is not None:
+                        fragment_levels = fragment_levels.to(self.device)
+                        
+                    fragment_parents = batch.get('fragment_parents', None)
+                    if fragment_parents is not None:
+                        fragment_parents = fragment_parents.to(self.device)
+                        
+                    fragment_residue_idx = batch.get('fragment_residue_idx', None)
+                    if fragment_residue_idx is not None:
+                        fragment_residue_idx = fragment_residue_idx.to(self.device)
 
                     # 有效位置掩码（避免 padding 污染监督信号）
                     if fragment_lengths is not None:
@@ -778,7 +852,9 @@ class Trainer:
                         strategy=self.masking_strategy,
                         timesteps=timesteps,
                         valid_mask=fragment_valid_mask,
-                        use_cosine_schedule=True
+                        use_cosine_schedule=True,
+                        fragment_levels=fragment_levels,
+                        fragment_parents=fragment_parents
                     )
                     
                     # 应用掩码
@@ -797,7 +873,10 @@ class Trainer:
                             frag_logits, tors_logits, offset_logits = self.decoder(
                                 node_embeddings=node_embeddings,
                                 target_fragments=masked_fragments,
-                                sequence_lengths=sequence_lengths
+                                fragment_mask=fragment_masks,
+                                sequence_lengths=sequence_lengths,
+                                backbone_coords=backbone_coords,
+                                fragment_residue_idx=fragment_residue_idx
                             )
                         except Exception as e:
                             if isinstance(e, torch.cuda.OutOfMemoryError):

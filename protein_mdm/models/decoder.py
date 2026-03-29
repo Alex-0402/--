@@ -101,6 +101,91 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class SpatialGeometricBias(nn.Module):
+    """
+    动态空间几何偏置 (Dynamic Spatial Geometric Bias)
+    将三维骨架几何信息和 Mask 状态注入到一维 Transformer Attention 中
+    """
+    def __init__(self, num_heads: int, num_rbf_bins: int = 16, chunk_size: int = 128):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_rbf_bins = num_rbf_bins
+        self.chunk_size = chunk_size
+        # 特征维度: RBF (bins) + 余弦相似度(1) + Mask状态i(1) + Mask状态j(1) = bins + 3
+        feature_dim = num_rbf_bins + 3
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, num_heads)
+        )
+        
+    def _rbf(self, D: torch.Tensor, D_min=0.0, D_max=20.0):
+        # 计算径向基函数 (Radial Basis Function)
+        D_mu = torch.linspace(D_min, D_max, self.num_rbf_bins, device=D.device)
+        D_mu = D_mu.view([1, 1, 1, -1])
+        D_sigma = (D_max - D_min) / self.num_rbf_bins
+        D_expand = D.unsqueeze(-1)
+        rbf = torch.exp(-((D_expand - D_mu) / D_sigma) ** 2)
+        return rbf
+        
+    def forward(self, backbone_coords, fragment_residue_idx, fragment_mask):
+        B, M = fragment_residue_idx.shape
+        device = backbone_coords.device
+        
+        # 提取 N, CA, C 坐标 [B, M, 3]
+        max_idx = backbone_coords.shape[1] - 1
+        # 防止因 padding 产生的无效残基索引越界
+        safe_idx = torch.clamp(fragment_residue_idx, min=0, max=max_idx)
+        batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(B, M)
+        
+        n_coords = backbone_coords[batch_indices, safe_idx, 0, :]
+        ca_coords = backbone_coords[batch_indices, safe_idx, 1, :]
+        c_coords = backbone_coords[batch_indices, safe_idx, 2, :]
+        
+        # NaN 防护：如果残基数据损坏导致坐标含 NaN，将其置零以防止梯度大爆炸
+        n_coords = torch.nan_to_num(n_coords, nan=0.0)
+        ca_coords = torch.nan_to_num(ca_coords, nan=0.0)
+        c_coords = torch.nan_to_num(c_coords, nan=0.0)
+        
+        # 近似侧链指向向量
+        n_ca = torch.nn.functional.normalize(n_coords - ca_coords, dim=-1)
+        c_ca = torch.nn.functional.normalize(c_coords - ca_coords, dim=-1)
+        v_dir = torch.nn.functional.normalize(n_ca + c_ca + 1e-6, dim=-1)
+        
+        # Mask 状态 [B, M, M]
+        if fragment_mask is None:
+            fragment_mask = torch.zeros((B, M), dtype=torch.bool, device=device)
+        mask_f = fragment_mask.float()
+        
+        # 仅保留最终注意力偏置，按行分块计算，避免提前构建 D_mat/cos_theta 的全量 O(M^2) 中间张量。
+        bias = torch.zeros(B, self.num_heads, M, M, dtype=n_coords.dtype, device=device)
+        for i in range(0, M, self.chunk_size):
+            end_idx = min(i + self.chunk_size, M)
+            
+            # [B, chunk, M]
+            ca_chunk = ca_coords[:, i:end_idx, :].unsqueeze(2)
+            D_chunk = torch.norm(ca_chunk - ca_coords.unsqueeze(1), dim=-1)
+
+            v_chunk = v_dir[:, i:end_idx, :]
+            cos_chunk = torch.einsum('bcd,bmd->bcm', v_chunk, v_dir).unsqueeze(-1)
+            
+            # Mask chunks: m_i is [B, chunk, 1], m_j is [B, 1, M] expanded to [B, chunk, M]
+            mi_chunk = mask_f[:, i:end_idx].unsqueeze(-1).unsqueeze(-1).expand(B, end_idx - i, M, 1)
+            mj_chunk = mask_f.unsqueeze(1).unsqueeze(-1).expand(B, end_idx - i, M, 1)
+            
+            # [B, chunk, M, bins]
+            rbf_chunk = self._rbf(D_chunk)
+            
+            feat_chunk = torch.cat([rbf_chunk, cos_chunk, mi_chunk, mj_chunk], dim=-1)
+            chunk_bias = self.mlp(feat_chunk)  # [B, chunk, M, Heads]
+            bias[:, :, i:end_idx, :] = chunk_bias.permute(0, 3, 1, 2)
+        
+        # PyTorch attention mask 形状要求为：[B * Heads, M, M] 
+        # 当它为 FloatTensor 且传给 tgt_mask 时，它会被直接相加到 Attention Scores 上
+        bias = bias.reshape(B * self.num_heads, M, M)
+        return bias
+
 class FragmentDecoder(nn.Module):
     """
     基于 Transformer 的片段解码器
@@ -140,6 +225,10 @@ class FragmentDecoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.num_heads = num_heads
+        # 提高空间偏置阈值：适配单卡11G显存+BatchSize=4计算极限
+        # M在3200以内可保持不OOM，绝大部分长链(2000-3000)均可纳入三维空间计算
+        self.max_spatial_bias_tokens = 2048
+        self._spatial_bias_warned = False
         
         # Fragment Embedding: 将 Token ID 映射为向量
         self.fragment_embedding = nn.Embedding(vocab_size, hidden_dim)
@@ -161,6 +250,9 @@ class FragmentDecoder(nn.Module):
             decoder_layer,
             num_layers=num_layers
         )
+        
+        # 注入动态空间几何偏置模块
+        self.spatial_bias = SpatialGeometricBias(num_heads=num_heads)
         
         # Encoder 输出的投影层（将 input_dim 投影到 hidden_dim）
         self.encoder_proj = nn.Linear(input_dim, hidden_dim)
@@ -259,7 +351,9 @@ class FragmentDecoder(nn.Module):
         node_embeddings: torch.Tensor,
         target_fragments: torch.Tensor,
         fragment_mask: Optional[torch.Tensor] = None,
-        sequence_lengths: Optional[torch.Tensor] = None
+        sequence_lengths: Optional[torch.Tensor] = None,
+        backbone_coords: Optional[torch.Tensor] = None,
+        fragment_residue_idx: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         前向传播
@@ -301,11 +395,32 @@ class FragmentDecoder(nn.Module):
         # 4. 创建掩码
         # Padding mask for memory (encoder output)
         memory_mask = self.create_padding_mask(seq_len, batch_size, sequence_lengths, device)
-        # Padding mask for target (fragment sequence)
-        tgt_mask = self.create_padding_mask(frag_seq_len, batch_size, None, device)
-        # Causal mask for self-attention
-        causal_mask = self.create_causal_mask(frag_seq_len, device)
         
+        # 4. 构建动态空间偏置 (替代了简单的 Causal Mask)
+        # 在标准的 Masked Language Model 或是 MDM 中，我们实际上需要双向注意力（可以看其余未被掩码的词）
+        # 但是为了注入物理约束，我们使用 spatial_tgt_mask 加在注意力分数上
+        spatial_tgt_mask = None
+        if (
+            backbone_coords is not None
+            and fragment_residue_idx is not None
+            and frag_seq_len <= self.max_spatial_bias_tokens
+        ):
+            spatial_tgt_mask = self.spatial_bias(backbone_coords, fragment_residue_idx, fragment_mask)
+        else:
+            # 大序列时回退，避免 O(M^2) 注意力偏置导致显存峰值失控
+            if (
+                backbone_coords is not None
+                and fragment_residue_idx is not None
+                and frag_seq_len > self.max_spatial_bias_tokens
+                and not self._spatial_bias_warned
+            ):
+                print(
+                    f"  ⚠️  序列长度 M={frag_seq_len} 超过空间偏置阈值 "
+                    f"{self.max_spatial_bias_tokens}，已回退到因果掩码以避免 OOM"
+                )
+                self._spatial_bias_warned = True
+            spatial_tgt_mask = self.create_causal_mask(frag_seq_len, device)
+
         # 5. Transformer Decoder
         # memory: [batch_size, L, hidden_dim] - Encoder 输出
         # tgt: [batch_size, M, hidden_dim] - 目标序列嵌入
@@ -324,59 +439,23 @@ class FragmentDecoder(nn.Module):
         memory_key_padding_mask = ~memory_mask  # 反转：False=有效，True=padding
         tgt_key_padding_mask = None  # 暂时不使用
         
-        try:
-            decoder_output = self.transformer_layers(
-                tgt=tgt_emb,
-                memory=memory,
-                tgt_mask=causal_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask
-            )  # [batch_size, M, hidden_dim]
-            
-            # 检查 decoder 输出是否有 NaN
-            if torch.isnan(decoder_output).any() or torch.isinf(decoder_output).any():
-                # 如果包含 NaN，尝试用 0 替换
-                decoder_output = torch.where(
-                    torch.isnan(decoder_output) | torch.isinf(decoder_output),
-                    torch.zeros_like(decoder_output),
-                    decoder_output
-                )
-        except Exception as e:
-            # 如果 transformer 失败，返回零输出
-            print(f"  ⚠️  Transformer decoder 失败: {e}")
-            decoder_output = torch.zeros(batch_size, frag_seq_len, self.hidden_dim, device=device)
+        decoder_output = self.transformer_layers(
+            tgt=tgt_emb,
+            memory=memory,
+            tgt_mask=spatial_tgt_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask
+        )  # [batch_size, M, hidden_dim]
+        decoder_output = torch.nan_to_num(decoder_output, nan=0.0, posinf=0.0, neginf=0.0)
         
         # 6. 预测头
-        try:
-            fragment_logits = self.type_head(decoder_output)  # [batch_size, M, vocab_size]
-            torsion_logits = self.torsion_head(decoder_output)  # [batch_size, M, num_torsion_bins]
-            offset_logits = self.offset_head(decoder_output)  # [batch_size, M, num_torsion_bins]
-            
-            # 检查预测输出是否有 NaN，如果有则替换为 0
-            if torch.isnan(fragment_logits).any() or torch.isinf(fragment_logits).any():
-                fragment_logits = torch.where(
-                    torch.isnan(fragment_logits) | torch.isinf(fragment_logits),
-                    torch.zeros_like(fragment_logits),
-                    fragment_logits
-                )
-            if torch.isnan(torsion_logits).any() or torch.isinf(torsion_logits).any():
-                torsion_logits = torch.where(
-                    torch.isnan(torsion_logits) | torch.isinf(torsion_logits),
-                    torch.zeros_like(torsion_logits),
-                    torsion_logits
-                )
-            if torch.isnan(offset_logits).any() or torch.isinf(offset_logits).any():
-                offset_logits = torch.where(
-                    torch.isnan(offset_logits) | torch.isinf(offset_logits),
-                    torch.zeros_like(offset_logits),
-                    offset_logits
-                )
-        except Exception as e:
-            # 如果预测头失败，返回零输出
-            print(f"  ⚠️  预测头失败: {e}")
-            fragment_logits = torch.zeros(batch_size, frag_seq_len, self.vocab_size, device=device)
-            torsion_logits = torch.zeros(batch_size, frag_seq_len, self.num_torsion_bins, device=device)
-            offset_logits = torch.zeros(batch_size, frag_seq_len, self.num_torsion_bins, device=device)
+        fragment_logits = self.type_head(decoder_output)  # [batch_size, M, vocab_size]
+        torsion_logits = self.torsion_head(decoder_output)  # [batch_size, M, num_torsion_bins]
+        offset_logits = self.offset_head(decoder_output)  # [batch_size, M, num_torsion_bins]
+
+        fragment_logits = torch.nan_to_num(fragment_logits, nan=0.0, posinf=0.0, neginf=0.0)
+        torsion_logits = torch.nan_to_num(torsion_logits, nan=0.0, posinf=0.0, neginf=0.0)
+        offset_logits = torch.nan_to_num(offset_logits, nan=0.0, posinf=0.0, neginf=0.0)
         
         return fragment_logits, torsion_logits, offset_logits
 

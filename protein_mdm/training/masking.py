@@ -34,6 +34,8 @@ def create_masks(
     timesteps: Optional[torch.Tensor] = None,
     use_cosine_schedule: bool = True,
     valid_mask: Optional[torch.Tensor] = None,
+    fragment_levels: Optional[torch.Tensor] = None,
+    fragment_parents: Optional[torch.Tensor] = None,
     **kwargs
 ) -> torch.Tensor:
     """
@@ -106,7 +108,41 @@ def create_masks(
         
         else:
             raise ValueError(f"Unknown masking strategy: {strategy}")
-        
+            
+        # Kinematic-Tree Aware Masking:
+        # 如果父节点被 Mask (Level N)，则子节点 (Level > N) 必须也被 Mask
+        if fragment_parents is not None and fragment_levels is not None:
+            # 使用精确的父节点指针树形传播（解决分支如 ILE, VAL 的误杀问题）
+            parents = fragment_parents[i]
+            levels = fragment_levels[i]
+            residue_start_idx = 0
+            for j in range(num_fragments):
+                if levels[j].item() == 0:
+                    residue_start_idx = j
+                
+                p_idx = parents[j].item()
+                if p_idx != -1:
+                    actual_parent_idx = residue_start_idx + p_idx
+                    # 确保索引安全，且总是访问在它之前的确定的父节点
+                    if 0 <= actual_parent_idx < j:
+                        if mask[actual_parent_idx]:
+                            mask[j] = True
+        elif fragment_levels is not None:
+            # Fallback: 简单前向扫描（对于只存在单一主链的旧缓存/假设下工作，可能对分叉链略有偏差）
+            levels = fragment_levels[i]
+            current_mask_level = -1
+            for j in range(num_fragments):
+                lvl = levels[j].item()
+                if lvl == 0:
+                    current_mask_level = -1 # reset at start of a new residue tree
+                
+                if mask[j]:
+                    if current_mask_level == -1 or lvl < current_mask_level:
+                        current_mask_level = lvl
+                else:
+                    if current_mask_level != -1 and lvl > current_mask_level:
+                        mask[j] = True # parent was masked, so mask this child
+
         masks.append(mask)
     
     return torch.stack(masks)

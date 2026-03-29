@@ -50,6 +50,8 @@ def main():
                        help="每轮最小提交比例（相对当前未确定Token）")
     parser.add_argument("--max_commit_ratio", type=float, default=0.40,
                        help="每轮最大提交比例（相对当前未确定Token）")
+    parser.add_argument("--energy_beta", type=float, default=0.1,
+                       help="能量向导衰减系数(越大则大基团越难在早期生成, 防碰撞)")
     parser.add_argument("--strategy", type=str, default="adaptive",
                        choices=["adaptive", "random", "both"],
                        help="推理策略: adaptive(自适应) / random(随机顺序) / both(两者对比)")
@@ -130,6 +132,8 @@ def main():
         return os.path.join(args.output_dir, f"{base_name}_{strategy_name}_predicted_sidechain.pdb")
 
     def decode_with_strategy(strategy_name: str, node_embeddings: torch.Tensor):
+        from data.vocabulary import FRAGMENT_FEATURES, PHYSICOCHEMICAL_FEATURES
+        
         frag_seq_len = len(sample['fragment_token_ids'])
         mask_token_id = vocab.token_to_idx["[MASK]"]
         target_fragments = torch.full(
@@ -141,6 +145,29 @@ def main():
 
         fragment_predictions = None
         torsion_predictions = None
+        
+        # ================= 拓扑与能量向导约束初始化 ================= 
+        # 1. 建立拓扑父节点约束：建立全局绝对索引
+        frag_levels = sample.get('fragment_levels', None)
+        frag_parents = sample.get('fragment_parents', None)
+        seq_parent_indices = torch.full((frag_seq_len,), -1, dtype=torch.long, device=device)
+        if frag_levels is not None and frag_parents is not None:
+            fl = frag_levels.cpu().numpy() if isinstance(frag_levels, torch.Tensor) else frag_levels
+            fp = frag_parents.cpu().numpy() if isinstance(frag_parents, torch.Tensor) else frag_parents
+            res_start = 0
+            for j in range(frag_seq_len):
+                if fl[j] == 0:
+                    res_start = j
+                if fp[j] != -1:
+                    seq_parent_indices[j] = res_start + fp[j]
+
+        # 2. 预查近似分子体积特征 (VDW代理)用于能量引导
+        token_vdw = torch.zeros(len(vocab.idx_to_token), device=device)
+        for t_idx, t_name in vocab.idx_to_token.items():
+            if t_name in FRAGMENT_FEATURES:
+                token_vdw[t_idx] = FRAGMENT_FEATURES[t_name][2]  # MW 分子量作为范德华体积代理
+            elif t_name in PHYSICOCHEMICAL_FEATURES:
+                token_vdw[t_idx] = PHYSICOCHEMICAL_FEATURES[t_name][2]
 
         print(f"\n3.{1 if strategy_name == 'random' else 2 if len(strategies) > 1 else 1} 推理策略: {strategy_name}")
         print(f"   迭代轮数: {args.num_iterations}")
@@ -170,8 +197,29 @@ def main():
             if strategy_name == "adaptive":
                 top2_vals, _ = torch.topk(frag_probs[0], k=2, dim=-1)
                 margins = top2_vals[:, 0] - top2_vals[:, 1]
+                
+                # ====== 1. Topology Mask Override ======
+                # 约束：子节点必定在父节点塌缩之后才能被填入
+                for m_idx in masked_indices:
+                    p_idx = seq_parent_indices[m_idx].item()
+                    if p_idx != -1 and target_fragments[0, p_idx] == mask_token_id:
+                        margins[m_idx] = -100.0  # 强制使置信度极低，阻止其被选中
+                
+                # ====== 2. Energy Guidance Penalty (VDW Proxy) ======
+                # 为了简易避免大体积侧链基团过早生成产生碰撞，基于基团大小对概率边际计算惩罚。
+                # 这实现了"由内而外, 由小到大"的动态物理推导顺序。
+                if hasattr(args, "energy_beta") and args.energy_beta > 0:
+                    for m_idx in masked_indices:
+                        if margins[m_idx] > -50.0: # 仅对满足拓扑的节点应用能量衰减
+                            pred_tok = predicted_tokens[m_idx]
+                            vol = token_vdw[pred_tok].item()
+                            if vol > 0:
+                                vdw_penalty = (vol / 100.0) * args.energy_beta
+                                margins[m_idx] -= vdw_penalty
+
                 masked_margins = margins[masked_positions]
-                avg_margin = masked_margins.mean().item() if masked_margins.numel() > 0 else 0.0
+                valid_margins = masked_margins[masked_margins > -50.0]
+                avg_margin = valid_margins.mean().item() if valid_margins.numel() > 0 else 0.0
                 avg_uncertainty = 1.0 - avg_margin
 
                 adaptive_ratio = base_ratio * (1.0 - 0.6 * avg_uncertainty)
@@ -179,9 +227,12 @@ def main():
                 if k == args.num_iterations - 1:
                     num_to_commit = remaining
                 else:
+                    # 确保不要超过拓扑合法的候选数
+                    legal_count = valid_margins.numel()
                     num_to_commit = max(1, int(np.ceil(remaining * adaptive_ratio)))
-                    num_to_commit = min(num_to_commit, remaining)
+                    num_to_commit = min(num_to_commit, legal_count)
 
+                # 最安全的一批填充
                 commit_local_idx = torch.topk(masked_margins, k=num_to_commit, largest=True).indices
                 commit_indices = masked_indices[commit_local_idx]
             else:
@@ -247,9 +298,54 @@ def main():
             pred_angles = undiscretize_angles(pred_torsion_bins[:min_tors_len], num_bins=72)
             diff = np.arctan2(np.sin(pred_angles - gt_angles), np.cos(pred_angles - gt_angles))
             torsion_mae_deg = np.degrees(np.mean(np.abs(diff)))
+
+            # CONDITIONAL MAE (Only correctly predicted fragments)
+            gt_frag_arr = np.array(gt_fragment_ids[:min_tors_len])
+            pred_frag_arr = np.array(pred_fragment_ids[:min_tors_len])
+            frag_correct_mask = (gt_frag_arr == pred_frag_arr)
+            cond_valid_mask = valid_mask & frag_correct_mask
+
+            if np.sum(cond_valid_mask) > 0:
+                if torsion_raw is not None:
+                    c_gt_angles = torsion_raw.cpu().numpy()[:min_tors_len][cond_valid_mask]
+                else:
+                    c_gt_bins = gt_torsion_bins[:min_tors_len][cond_valid_mask]
+                    c_gt_angles = undiscretize_angles(c_gt_bins, num_bins=72)
+                    
+                c_pred_bins = pred_torsion_bins[:min_tors_len][cond_valid_mask]
+                c_pred_angles_raw = undiscretize_angles(c_pred_bins, num_bins=72)
+                c_pred_offsets = offset_predictions.cpu().numpy()[:min_tors_len][cond_valid_mask]
+                c_pred_angles = c_pred_angles_raw + c_pred_offsets * (2 * np.pi / 72)
+                
+                c_diff = np.arctan2(np.sin(c_pred_angles - c_gt_angles), np.cos(c_pred_angles - c_gt_angles))
+                cond_torsion_mae_deg = np.degrees(np.mean(np.abs(c_diff)))
+            else:
+                cond_torsion_mae_deg = float('nan')
+
+            # MAE by Chi Level (0 to 4 based on fragment_levels)
+            chi_mae_dict = {}
+            if 'fragment_levels' in sample:
+                levels = sample['fragment_levels'].cpu().numpy()[:min_tors_len]
+                for lvl in range(5): # Expected 0, 1, 2, 3, 4
+                    lvl_mask = valid_mask & (levels == lvl) & frag_correct_mask # Evaluated on correct fragments!
+                    if np.sum(lvl_mask) > 0:
+                        if torsion_raw is not None:
+                            l_gt = torsion_raw.cpu().numpy()[:min_tors_len][lvl_mask]
+                        else:
+                            l_gt_bins = gt_torsion_bins[:min_tors_len][lvl_mask]
+                            l_gt = undiscretize_angles(l_gt_bins, num_bins=72)
+                        l_pred_bins = pred_torsion_bins[:min_tors_len][lvl_mask]
+                        l_pred_raw = undiscretize_angles(l_pred_bins, num_bins=72)
+                        l_pred_off = offset_predictions.cpu().numpy()[:min_tors_len][lvl_mask]
+                        l_pred = l_pred_raw + l_pred_off * (2 * np.pi / 72)
+                        l_diff = np.arctan2(np.sin(l_pred - l_gt), np.cos(l_pred - l_gt))
+                        chi_mae_dict[f'chi_{lvl+1}'] = np.degrees(np.mean(np.abs(l_diff)))
+
         else:
             torsion_bin_acc = float('nan')
             torsion_mae_deg = float('nan')
+            cond_torsion_mae_deg = float('nan')
+            chi_mae_dict = {}
 
         gt_fragments = vocab.indices_to_fragments(gt_fragment_ids)
         residue_types = sample.get('residue_types', [])
@@ -269,7 +365,11 @@ def main():
         print(f"   Fragment Token Acc: {frag_token_acc:.4f}")
         print(f"   Residue侧链类型一致率(Exact): {residue_type_match_rate:.4f}")
         print(f"   Torsion Bin Acc: {torsion_bin_acc:.4f}")
-        print(f"   Torsion Circular MAE: {torsion_mae_deg:.2f}°")
+        print(f"   全局 Torsion MAE (含错片): {torsion_mae_deg:.2f}°")
+        print(f"   条件 Torsion MAE (仅对片): {cond_torsion_mae_deg:.2f}°")
+        if chi_mae_dict:
+            chi_strs = [f"{k}={v:.1f}°" for k, v in chi_mae_dict.items()]
+            print(f"   分层条件 MAE (Chi-1~5): " + " | ".join(chi_strs))
 
         print(f"\n5. 结构重建与评估 ({strategy_name})")
         backbone_np = sample['backbone_coords'].cpu().numpy()
@@ -349,8 +449,8 @@ def main():
 
         all_results = []
         for strategy_name in strategies:
-            fragment_predictions, torsion_predictions = decode_with_strategy(strategy_name, node_embeddings)
-            result = evaluate_and_report(strategy_name, fragment_predictions, torsion_predictions)
+            fragment_predictions, torsion_predictions, offset_predictions = decode_with_strategy(strategy_name, node_embeddings)
+            result = evaluate_and_report(strategy_name, fragment_predictions, torsion_predictions, offset_predictions)
             all_results.append(result)
 
         if len(all_results) > 1:
