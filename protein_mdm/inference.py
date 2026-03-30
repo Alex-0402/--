@@ -132,7 +132,9 @@ def main():
         return os.path.join(args.output_dir, f"{base_name}_{strategy_name}_predicted_sidechain.pdb")
 
     def decode_with_strategy(strategy_name: str, node_embeddings: torch.Tensor):
-        from data.vocabulary import FRAGMENT_FEATURES, PHYSICOCHEMICAL_FEATURES
+        from data.vocabulary import FragmentVocab
+        FRAGMENT_FEATURES = FragmentVocab.FRAGMENT_FEATURES
+        PHYSICOCHEMICAL_FEATURES = FragmentVocab.PHYSICOCHEMICAL_FEATURES
         
         frag_seq_len = len(sample['fragment_token_ids'])
         mask_token_id = vocab.token_to_idx["[MASK]"]
@@ -172,10 +174,16 @@ def main():
         print(f"\n3.{1 if strategy_name == 'random' else 2 if len(strategies) > 1 else 1} 推理策略: {strategy_name}")
         print(f"   迭代轮数: {args.num_iterations}")
 
+        fragment_residue_idx = sample.get('fragment_residue_idx', None)
+        if fragment_residue_idx is not None and fragment_residue_idx.dim() == 1:
+            fragment_residue_idx = fragment_residue_idx.unsqueeze(0).to(device)
+
         for k in range(args.num_iterations):
             frag_logits, tors_logits, _ = decoder(
                 node_embeddings=node_embeddings,
-                target_fragments=target_fragments
+                target_fragments=target_fragments,
+                fragment_residue_idx=fragment_residue_idx,
+                backbone_coords=backbone_coords
             )
             frag_probs = torch.softmax(frag_logits, dim=-1)
             predicted_tokens = torch.argmax(frag_logits, dim=-1)[0]
@@ -267,7 +275,9 @@ def main():
 
         frag_logits, tors_logits, _ = decoder(
             node_embeddings=node_embeddings,
-            target_fragments=target_fragments
+            target_fragments=target_fragments,
+            fragment_residue_idx=fragment_residue_idx,
+            backbone_coords=backbone_coords
         )
         fragment_predictions = torch.argmax(frag_logits, dim=-1)[0]
         torsion_predictions = torch.argmax(tors_logits, dim=-1)[0]
@@ -303,7 +313,10 @@ def main():
             gt_frag_arr = np.array(gt_fragment_ids[:min_tors_len])
             pred_frag_arr = np.array(pred_fragment_ids[:min_tors_len])
             frag_correct_mask = (gt_frag_arr == pred_frag_arr)
+            valid_mask = np.ones(min_tors_len, dtype=bool) # Assume all are valid initially
             cond_valid_mask = valid_mask & frag_correct_mask
+            
+            torsion_raw = sample.get('torsion_angles', None)
 
             if np.sum(cond_valid_mask) > 0:
                 if torsion_raw is not None:
@@ -313,9 +326,7 @@ def main():
                     c_gt_angles = undiscretize_angles(c_gt_bins, num_bins=72)
                     
                 c_pred_bins = pred_torsion_bins[:min_tors_len][cond_valid_mask]
-                c_pred_angles_raw = undiscretize_angles(c_pred_bins, num_bins=72)
-                c_pred_offsets = offset_predictions.cpu().numpy()[:min_tors_len][cond_valid_mask]
-                c_pred_angles = c_pred_angles_raw + c_pred_offsets * (2 * np.pi / 72)
+                c_pred_angles = undiscretize_angles(c_pred_bins, num_bins=72)
                 
                 c_diff = np.arctan2(np.sin(c_pred_angles - c_gt_angles), np.cos(c_pred_angles - c_gt_angles))
                 cond_torsion_mae_deg = np.degrees(np.mean(np.abs(c_diff)))
@@ -335,9 +346,7 @@ def main():
                             l_gt_bins = gt_torsion_bins[:min_tors_len][lvl_mask]
                             l_gt = undiscretize_angles(l_gt_bins, num_bins=72)
                         l_pred_bins = pred_torsion_bins[:min_tors_len][lvl_mask]
-                        l_pred_raw = undiscretize_angles(l_pred_bins, num_bins=72)
-                        l_pred_off = offset_predictions.cpu().numpy()[:min_tors_len][lvl_mask]
-                        l_pred = l_pred_raw + l_pred_off * (2 * np.pi / 72)
+                        l_pred = undiscretize_angles(l_pred_bins, num_bins=72)
                         l_diff = np.arctan2(np.sin(l_pred - l_gt), np.cos(l_pred - l_gt))
                         chi_mae_dict[f'chi_{lvl+1}'] = np.degrees(np.mean(np.abs(l_diff)))
 
@@ -445,12 +454,15 @@ def main():
     with torch.no_grad():
         residue_types = sample.get('residue_types', None)
         encoder_residue_types = [residue_types] if residue_types is not None else None
-        node_embeddings = encoder(backbone_coords, residue_types=encoder_residue_types)
+        
+        # 严格防止数据泄露：完全禁止编码器接受真实序列
+        # node_embeddings = encoder(backbone_coords, residue_types=encoder_residue_types)
+        node_embeddings = encoder(backbone_coords, residue_types=None)
 
         all_results = []
         for strategy_name in strategies:
-            fragment_predictions, torsion_predictions, offset_predictions = decode_with_strategy(strategy_name, node_embeddings)
-            result = evaluate_and_report(strategy_name, fragment_predictions, torsion_predictions, offset_predictions)
+            fragment_predictions, torsion_predictions = decode_with_strategy(strategy_name, node_embeddings)
+            result = evaluate_and_report(strategy_name, fragment_predictions, torsion_predictions)
             all_results.append(result)
 
         if len(all_results) > 1:

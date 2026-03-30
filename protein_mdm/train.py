@@ -84,6 +84,8 @@ def parse_args():
                        help="验证集比例（如果使用预定义划分，则忽略此参数）")
     parser.add_argument("--use_predefined_split", action="store_true",
                        help="使用预定义的 train.txt 和 val.txt 划分（如果存在）")
+    parser.add_argument("--allowlist_txt", type=str, default=None,
+                       help="使用指定的高质量PDB过滤列表(如 data/high_quality_pdbs.txt)，过滤不需要的数据")
     
     # 模型参数
     parser.add_argument("--hidden_dim", type=int, default=256,
@@ -316,12 +318,14 @@ def main():
         train_dataset = ProteinStructureDataset(
             train_paths,
             cache_dir=args.cache_dir,
-            augment=True  # 训练时启用数据增强
+            augment=True,  # 训练时启用数据增强
+            allowlist_txt=args.allowlist_txt
         )
         val_dataset = ProteinStructureDataset(
             val_paths,
             cache_dir=args.cache_dir,
-            augment=False  # 验证时禁用数据增强，确保稳定的验证损失
+            augment=False,  # 验证时禁用数据增强，确保稳定的验证损失
+            allowlist_txt=args.allowlist_txt
         )
         if rank == 0:
             print(f"   训练集: {len(train_dataset)} 个样本")
@@ -332,7 +336,8 @@ def main():
         temp_dataset = ProteinStructureDataset(
             args.pdb_path,
             cache_dir=args.cache_dir,
-            augment=False  # 临时数据集，augment 参数不重要
+            augment=False,  # 临时数据集，augment 参数不重要
+            allowlist_txt=args.allowlist_txt
         )
         if rank == 0:
             print(f"   数据集大小: {len(temp_dataset)}")
@@ -352,7 +357,8 @@ def main():
                 ProteinStructureDataset(
                     args.pdb_path,
                     cache_dir=args.cache_dir,
-                    augment=True  # 训练时启用数据增强
+                    augment=True,  # 训练时启用数据增强
+                    allowlist_txt=args.allowlist_txt
                 ),
                 train_indices.indices
             )
@@ -362,7 +368,8 @@ def main():
                 ProteinStructureDataset(
                     args.pdb_path,
                     cache_dir=args.cache_dir,
-                    augment=False  # 验证时禁用数据增强，确保稳定的验证损失
+                    augment=False,  # 验证时禁用数据增强，确保稳定的验证损失
+                    allowlist_txt=args.allowlist_txt
                 ),
                 val_indices.indices
             )
@@ -374,7 +381,8 @@ def main():
             train_dataset = ProteinStructureDataset(
                 args.pdb_path,
                 cache_dir=args.cache_dir,
-                augment=True  # 训练时启用数据增强
+                augment=True,  # 训练时启用数据增强
+                allowlist_txt=args.allowlist_txt
             )
             val_dataset = None
 

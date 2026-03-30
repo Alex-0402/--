@@ -34,7 +34,7 @@ shift # 将第一个参数弹出，剩下的参数后续透传给 inference.py
 # 默认环境变量配置（可通过 export 覆盖）
 GPU_ID="${GPU_ID:-0}"
 # 默认使用2万数据集跑出来的最新best_model
-MODEL_PATH="${MODEL_PATH:-checkpoints_20000_0327/best_model.pt}"
+MODEL_PATH="${MODEL_PATH:-checkpoints_20000_0328/best_model.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-inference_outputs}"
 NUM_ITER="${NUM_ITER:-12}"
 

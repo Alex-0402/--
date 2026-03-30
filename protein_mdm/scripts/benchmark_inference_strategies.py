@@ -27,6 +27,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from statistics import mean, pstdev
+from tqdm import tqdm
 
 
 SUMMARY_RE = re.compile(
@@ -79,6 +80,7 @@ def main():
     parser.add_argument("--max_commit_ratio", type=float, default=0.20)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--save_fail_logs_dir", type=str, default="benchmark_fail_logs")
+    parser.add_argument("--test_list", type=str, default=None, help="如 data/cache_20000/test.txt，只评估该名单里的PDB")
     args = parser.parse_args()
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -91,13 +93,26 @@ def main():
     if not os.path.isdir(args.pdb_dir):
         raise ValueError(f"pdb_dir 不存在: {args.pdb_dir}")
 
-    pdb_files = sorted(
-        os.path.join(args.pdb_dir, f)
-        for f in os.listdir(args.pdb_dir)
-        if f.endswith(".pdb")
-    )
+    if args.test_list and os.path.exists(args.test_list):
+        print(f"读取测试集列表: {args.test_list}")
+        with open(args.test_list, 'r') as f:
+            test_ids = [line.strip() for line in f if line.strip()]
+        pdb_files = []
+        for tid in test_ids:
+            target_pdb = os.path.join(args.pdb_dir, f"{tid}.pdb")
+            target_cif = os.path.join(args.pdb_dir, f"{tid}.cif")
+            if os.path.exists(target_pdb): pdb_files.append(target_pdb)
+            elif os.path.exists(target_cif): pdb_files.append(target_cif)
+        print(f"名单内共计有 {len(test_ids)} 项，匹配到本地实体的有 {len(pdb_files)} 项。")
+    else:
+        pdb_files = sorted(
+            os.path.join(args.pdb_dir, f)
+            for f in os.listdir(args.pdb_dir)
+            if f.endswith(".pdb") or f.endswith(".cif")
+        )
+
     if len(pdb_files) == 0:
-        raise ValueError(f"未在目录中找到 .pdb 文件: {args.pdb_dir}")
+        raise ValueError(f"未在目录中找到结构文件: {args.pdb_dir}")
 
     pdb_files = pdb_files[: args.max_samples]
     os.makedirs(args.save_fail_logs_dir, exist_ok=True)
@@ -116,6 +131,7 @@ def main():
     total_jobs = len(pdb_files) * len(seeds)
     done = 0
 
+    pbar = tqdm(total=total_jobs, desc="[基准测试进度]")
     for pdb_path in pdb_files:
         pdb_name = os.path.basename(pdb_path)
         for seed in seeds:
@@ -151,7 +167,8 @@ def main():
                     f.write(proc.stdout)
                     f.write("\n\n[STDERR]\n")
                     f.write(proc.stderr)
-                print(f"[{done}/{total_jobs}] FAIL {pdb_name} seed={seed} -> {fail_log}")
+                pbar.write(f"[{done}/{total_jobs}] FAIL {pdb_name} seed={seed} -> {fail_log}")
+                pbar.update(1)
                 continue
 
             parsed = parse_summary(proc.stdout)
@@ -165,7 +182,8 @@ def main():
                     f.write(proc.stdout)
                     f.write("\n\n[STDERR]\n")
                     f.write(proc.stderr)
-                print(f"[{done}/{total_jobs}] PARSE_FAIL {pdb_name} seed={seed} -> {fail_log}")
+                pbar.write(f"[{done}/{total_jobs}] PARSE_FAIL {pdb_name} seed={seed} -> {fail_log}")
+                pbar.update(1)
                 continue
 
             for strategy in ("random", "adaptive"):
@@ -176,7 +194,10 @@ def main():
                     "strategy": strategy,
                     **r,
                 })
-            print(f"[{done}/{total_jobs}] OK {pdb_name} seed={seed}")
+            pbar.update(1)
+            # pbar.write(f"[{done}/{total_jobs}] OK {pdb_name} seed={seed}")
+            
+    pbar.close()
 
     # 保存 CSV
     fieldnames = [

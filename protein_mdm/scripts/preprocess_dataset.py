@@ -111,6 +111,12 @@ def main():
         action="store_true",
         help="使用 mmCIF 格式"
     )
+    parser.add_argument(
+        "--allowlist_txt",
+        type=str,
+        default=None,
+        help="如果提供，则仅缓存该名单中的 PDB 文件（如 high_quality_pdbs.txt）"
+    )
     
     args = parser.parse_args()
     
@@ -125,11 +131,21 @@ def main():
     # 收集 PDB 文件
     print(f"扫描 PDB 文件目录: {args.pdb_dir}")
     extensions = ['.pdb', '.cif'] if args.use_mmcif else ['.pdb']
-    pdb_files = [
-        os.path.join(args.pdb_dir, f)
-        for f in os.listdir(args.pdb_dir)
-        if any(f.endswith(ext) for ext in extensions)
-    ]
+    
+    # 解析 allowlist
+    valid_names = None
+    if args.allowlist_txt and os.path.exists(args.allowlist_txt):
+        print(f"读取高质量过滤名单: {args.allowlist_txt}")
+        with open(args.allowlist_txt, 'r') as f:
+            valid_names = set(line.strip()[:4].lower() for line in f if line.strip())
+            
+    pdb_files = []
+    for f in os.listdir(args.pdb_dir):
+        if any(f.endswith(ext) for ext in extensions):
+            basename = os.path.splitext(f)[0][:4].lower()
+            if valid_names is None or basename in valid_names:
+                pdb_files.append(os.path.join(args.pdb_dir, f))
+    
     
     if len(pdb_files) == 0:
         raise ValueError(f"在 {args.pdb_dir} 中未找到 PDB 文件")

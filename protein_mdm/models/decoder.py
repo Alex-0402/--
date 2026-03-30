@@ -388,6 +388,16 @@ class FragmentDecoder(nn.Module):
         else:
             # target_fragments 已经是嵌入向量
             tgt_emb = target_fragments
+            
+        # 2.5 跨重映射：注入父节点（主链残基）的几何和特征记忆
+        if fragment_residue_idx is not None:
+            max_idx = memory.shape[1] - 1
+            # 保证索引安全，避免 padding 或残基位置计算溢出
+            safe_residue_idx = torch.clamp(fragment_residue_idx, min=0, max=max_idx)
+            batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand(batch_size, frag_seq_len)
+            parent_memory = memory[batch_indices, safe_residue_idx, :]  # [batch_size, M, hidden_dim]
+            # 最关键的一步：让每个 Token (包括 MASK) 都天然带着“我是骨架上第N个锚点”的三维身份
+            tgt_emb = tgt_emb + parent_memory
         
         # 3. 添加位置编码
         tgt_emb = self.pos_encoder(tgt_emb)  # [batch_size, M, hidden_dim]
@@ -437,7 +447,13 @@ class FragmentDecoder(nn.Module):
         # 注意：PyTorch 的 TransformerDecoder 需要 memory_key_padding_mask 和 tgt_key_padding_mask
         # 格式是：False 表示有效位置，True 表示需要忽略的位置（与我们的掩码相反）
         memory_key_padding_mask = ~memory_mask  # 反转：False=有效，True=padding
-        tgt_key_padding_mask = None  # 暂时不使用
+        
+        # 动态计算目标序列的 Padding Mask，防止 MASK 等有效 token 被 <PAD> 特征污染
+        if target_fragments.dim() == 2 and target_fragments.dtype == torch.long:
+            # 引入 SpecialTokens.PAD (=0)。要求模型在此处完全忽略填充区
+            tgt_key_padding_mask = (target_fragments == 0)
+        else:
+            tgt_key_padding_mask = None
         
         decoder_output = self.transformer_layers(
             tgt=tgt_emb,

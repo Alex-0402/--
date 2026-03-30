@@ -73,7 +73,8 @@ class ProteinStructureDataset(Dataset):
         use_mmcif: bool = False,
         cache_dir: Optional[str] = None,
         lazy_loading: bool = True,
-        augment: bool = False
+        augment: bool = False,
+        allowlist_txt: Optional[str] = None
     ):
         """
         Initialize the dataset.
@@ -137,6 +138,27 @@ class ProteinStructureDataset(Dataset):
                 raise ValueError(f"Invalid path: {pdb_files}")
         else:
             self.pdb_files = pdb_files
+
+        # 🔥 添加对高质量 PDB 列表的过滤
+        if allowlist_txt is not None:
+            if os.path.exists(allowlist_txt):
+                with open(allowlist_txt, 'r') as f:
+                    allowed_sets = {line.strip().lower() for line in f if line.strip()}
+                
+                filtered_files = []
+                for p in self.pdb_files:
+                    # 提取文件名（不含扩展名）转小写作为标识符
+                    base_name = os.path.basename(p).split('.')[0].lower()
+                    if base_name in allowed_sets:
+                        filtered_files.append(p)
+                
+                # 仅当主进程时打印过滤信息
+                if os.getpid() == os.getppid() or not hasattr(os, 'getppid'):
+                    print(f"Applied high_quality_pdbs.txt filter: kept {len(filtered_files)} / {len(self.pdb_files)} files.")
+                self.pdb_files = filtered_files
+            else:
+                if os.getpid() == os.getppid() or not hasattr(os, 'getppid'):
+                    print(f"⚠️ 警告: allowlist_txt '{allowlist_txt}' 不存在，跳过过滤。")
         
         if len(self.pdb_files) == 0:
             raise ValueError("No PDB files found!")
@@ -395,24 +417,23 @@ class ProteinStructureDataset(Dataset):
             fragment_residue_idx_tensor = torch.tensor(fragment_residue_idx, dtype=torch.long)
             
             # 构建“与片段序列对齐”的 torsion 监督：长度与 fragment_token_ids 一致
-            # 策略：每个残基只在其第一个片段位置监督 chi1（若存在），其余片段位置置无效
+            # 策略：每个残基的第 i 个片段位置对应监督其第 i 个 chi 角（若存在），支持最多chi1~chi4的完整侧链构象
             aligned_torsion_raw = []
             aligned_torsion_valid = []
-            for frags, chi1 in zip(fragment_tokens, torsion_angles_by_residue):
+            for frags, chis in zip(fragment_tokens, torsion_angles_by_residue):
                 frag_n = len(frags)
                 if frag_n == 0:
                     continue
-                if chi1 is not None:
-                    aligned_torsion_raw.append(float(chi1))
-                    aligned_torsion_valid.append(True)
-                else:
-                    aligned_torsion_raw.append(0.0)
-                    aligned_torsion_valid.append(False)
-
-                for _ in range(frag_n - 1):
-                    aligned_torsion_raw.append(0.0)
-                    aligned_torsion_valid.append(False)
-
+                
+                # 遍历分配每个片段的二面角（多片段长侧链自然展开）
+                for i in range(frag_n):
+                    if chis is not None and i < len(chis) and chis[i] is not None:
+                        aligned_torsion_raw.append(float(chis[i]))
+                        aligned_torsion_valid.append(True)
+                    else:
+                        aligned_torsion_raw.append(0.0)
+                        aligned_torsion_valid.append(False)
+                        
             if len(aligned_torsion_raw) > 0:
                 torsion_bins = discretize_angles(np.array(aligned_torsion_raw), num_bins=72)
                 torsion_tensor = torch.tensor(torsion_bins, dtype=torch.long)
@@ -570,7 +591,7 @@ class ProteinStructureDataset(Dataset):
         backbone_coords = []
         fragment_tokens = []
         torsion_angles = []
-        torsion_angles_by_residue: List[Optional[float]] = []
+        torsion_angles_by_residue: List[List[Optional[float]]] = []
         residue_types = []
         
         residues = list(chain.get_residues())
@@ -604,28 +625,20 @@ class ProteinStructureDataset(Dataset):
             fragments = self.vocab.residue_to_fragments(res_name)
             fragment_tokens.append(fragments)
             
-            # Extract torsion angles from side-chain
-            # Note: This is a simplified version. In practice, you would need
-            # to identify the specific torsion angles for each residue type.
-            # For now, we extract chi angles (side-chain dihedrals) if available.
+            # 解封完整的 CHI1-CHI4 多级复杂侧链计算
             residue_torsions = self._extract_residue_torsions(residue)
-            torsion_angles.extend(residue_torsions)
-            torsion_angles_by_residue.append(float(residue_torsions[0]) if len(residue_torsions) > 0 else None)
-        
+            torsion_angles.extend([t for t in residue_torsions if t is not None])
+            torsion_angles_by_residue.append(residue_torsions)
+            
         if len(backbone_coords) == 0:
             return np.zeros((0, 4, 3)), [], [], [], []
         
         backbone_coords = np.array(backbone_coords)
         return backbone_coords, fragment_tokens, torsion_angles, residue_types, torsion_angles_by_residue
     
-    def _extract_residue_torsions(self, residue) -> List[float]:
+    def _extract_residue_torsions(self, residue) -> List[Optional[float]]:
         """
-        Extract torsion angles (chi angles) from a residue's side-chain.
-        
-        This is a simplified implementation. In practice, you would need to:
-        1. Identify the specific chi angles for each residue type
-        2. Extract the appropriate atom coordinates
-        3. Calculate dihedral angles
+        Extract complete torsion angles (chi1 - chi4) from a residue's side-chain.
         
         Args:
             residue: BioPython Residue object
@@ -636,38 +649,42 @@ class ProteinStructureDataset(Dataset):
         res_name = residue.get_resname()
         torsion_angles = []
         
-        # Simplified: Extract chi1 angle for residues with side-chains
-        # Chi1 is typically defined as: N-CA-CB-CG (or similar)
-        try:
-            # Get backbone atoms
-            n_atom = residue['N']
-            ca_atom = residue['CA']
-            
-            # Try to get side-chain atoms (this is residue-specific)
-            if 'CB' in residue:
-                cb_atom = residue['CB']
+        # 完整氨基酸侧链二面角定义字典 (\chi 1 - 4)
+        CHI_ATOMS = {
+            'ARG': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD'], ['CB', 'CG', 'CD', 'NE'], ['CG', 'CD', 'NE', 'CZ']],
+            'LYS': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD'], ['CB', 'CG', 'CD', 'CE'], ['CG', 'CD', 'CE', 'NZ']],
+            'MET': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'SD'], ['CB', 'CG', 'SD', 'CE']],
+            'GLU': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD'], ['CB', 'CG', 'CD', 'OE1']],
+            'GLN': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD'], ['CB', 'CG', 'CD', 'OE1']],
+            'ILE': [['N', 'CA', 'CB', 'CG1'], ['CA', 'CB', 'CG1', 'CD1']],
+            'LEU': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD1']], # 有时定义不同，取一种主流的
+            'PRO': [['N', 'CA', 'CB', 'CG']],
+            'THR': [['N', 'CA', 'CB', 'OG1']],
+            'VAL': [['N', 'CA', 'CB', 'CG1']],
+            'ASP': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'OD1']],
+            'ASN': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'OD1']],
+            'TRP': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD1']],
+            'TYR': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD1']],
+            'PHE': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD1']],
+            'HIS': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'ND1']],
+            'CYS': [['N', 'CA', 'CB', 'SG']],
+            'SER': [['N', 'CA', 'CB', 'OG']]
+        }
+
+        # 如果没有 \chi 角的残基 (ALA, GLY)，直接返回空序列
+        if res_name not in CHI_ATOMS:
+            return []
+
+        # 尝试依级计算每个 \chi 角
+        for atom_names in CHI_ATOMS[res_name]:
+            try:
+                coords = np.array([residue[an].get_coord() for an in atom_names])
+                angle = calculate_dihedrals(coords, [(0, 1, 2, 3)])[0]
+                torsion_angles.append(angle)
+            except (KeyError, IndexError):
+                # 缺失原子导致该层级及以后无法计算，置空填充占位
+                torsion_angles.append(None)
                 
-                # Try to find next atom in side-chain
-                next_atom = None
-                for atom_name in ['CG', 'CG1', 'OG', 'OG1', 'SG']:
-                    if atom_name in residue:
-                        next_atom = residue[atom_name]
-                        break
-                
-                if next_atom is not None:
-                    # Calculate chi1 angle
-                    coords = np.array([
-                        n_atom.get_coord(),
-                        ca_atom.get_coord(),
-                        cb_atom.get_coord(),
-                        next_atom.get_coord()
-                    ])
-                    angle = calculate_dihedrals(coords, [(0, 1, 2, 3)])[0]
-                    torsion_angles.append(angle)
-        except (KeyError, IndexError):
-            # Missing atoms - skip this torsion
-            pass
-        
         return torsion_angles
 
 

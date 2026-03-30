@@ -89,7 +89,7 @@ fi
 GPU_IDS="${GPU_IDS:-1,2,3,4,5,6,7}"
 EPOCHS="${EPOCHS:-600}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
-SAVE_DIR="${SAVE_DIR:-checkpoints_20000_0327}"
+SAVE_DIR="${SAVE_DIR:-checkpoints_20000_0328}"
 MASTER_PORT="${MASTER_PORT:-29506}"
 
 # 从 GPU_IDS 自动计算进程数
@@ -137,6 +137,7 @@ nohup torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${MASTER_PORT
     --early_stopping_min_delta 0.001 \
     --dropout 0.3 \
     --save_dir "${SAVE_DIR}" \
+    --allowlist_txt "data/high_quality_pdbs.txt" \
     ${RESUME_ARG} \
     ${DEBUG_ARG} \
     "${EXTRA_ARGS[@]}" </dev/null > "$LOG_FILE" 2>&1 &

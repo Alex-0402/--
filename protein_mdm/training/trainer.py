@@ -640,8 +640,9 @@ class Trainer:
                 self.optimizer.zero_grad()
                 
                 # Encoder（传递残基类型以支持理化特征）
-                residue_types = batch.get('residue_types', None)
-                node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=residue_types)
+                # 严格防止数据泄露：在此处设为 None 避免通过物理化学特征作弊
+                # node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=residue_types)
+                node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=None)
                 
                 # Decoder
                 frag_logits, tors_logits, offset_logits = self.decoder(
@@ -862,8 +863,9 @@ class Trainer:
                     
                     # 前向传播（传递残基类型以支持理化特征）
                     try:
-                        residue_types = batch.get('residue_types', None)
-                        node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=residue_types)
+                        # 严格防止数据泄露：绝不传入真实的 residue_types 给编码器
+                        # node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=residue_types)
+                        node_embeddings = self.encoder(backbone_coords, mask=None, residue_types=None)
                         if torch.isnan(node_embeddings).any() or torch.isinf(node_embeddings).any():
                             if self.rank == 0:
                                 print(f"  ⚠️  警告: encoder 输出包含 NaN/Inf，跳过此批次")
