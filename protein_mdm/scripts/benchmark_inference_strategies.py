@@ -33,7 +33,8 @@ from tqdm import tqdm
 SUMMARY_RE = re.compile(
     r"^\s*(random|adaptive)\s+\|\s+"
     r"FragAcc=([0-9.]+)\s+\|\s+"
-    r"ResExact=([0-9.]+)\s+\|\s+"
+    r"Strict=([0-9.]+)\s+\|\s+"
+    r"RlxAAR=([0-9.]+)\s+\|\s+"
     r"Coverage=([0-9.]+)\s+\|\s+"
     r"RMSD_all=([0-9.]+)\s+\|\s+"
     r"RMSD_matched=([0-9.]+)\s+\|\s+"
@@ -52,10 +53,11 @@ def parse_summary(stdout: str):
         result[strategy] = {
             "frag_acc": float(m.group(2)),
             "res_exact": float(m.group(3)),
-            "coverage": float(m.group(4)),
-            "rmsd_all": float(m.group(5)),
-            "rmsd_matched": float(m.group(6)),
-            "clash": float(m.group(7)),
+            "res_relaxed": float(m.group(4)),
+            "coverage": float(m.group(5)),
+            "rmsd_all": float(m.group(6)),
+            "rmsd_matched": float(m.group(7)),
+            "clash": float(m.group(8)),
         }
     return result
 
@@ -202,7 +204,7 @@ def main():
     # 保存 CSV
     fieldnames = [
         "pdb", "seed", "strategy",
-        "frag_acc", "res_exact", "coverage",
+        "frag_acc", "res_exact", "res_relaxed", "coverage",
         "rmsd_all", "rmsd_matched", "clash",
     ]
     with open(args.output_csv, "w", newline="", encoding="utf-8") as f:
@@ -217,7 +219,7 @@ def main():
     by_strategy = defaultdict(lambda: defaultdict(list))
     for r in rows:
         s = r["strategy"]
-        for k in ("frag_acc", "res_exact", "coverage", "rmsd_all", "rmsd_matched", "clash"):
+        for k in ("frag_acc", "res_exact", "res_relaxed", "coverage", "rmsd_all", "rmsd_matched", "clash"):
             by_strategy[s][k].append(float(r[k]))
 
     print("\n策略均值 ± 标准差:")
@@ -225,7 +227,7 @@ def main():
         if s not in by_strategy:
             continue
         print(f"  [{s}]")
-        for k in ("frag_acc", "res_exact", "coverage", "rmsd_all", "rmsd_matched", "clash"):
+        for k in ("frag_acc", "res_exact", "res_relaxed", "coverage", "rmsd_all", "rmsd_matched", "clash"):
             m, sd = agg(by_strategy[s][k])
             print(f"    {k:12s}: {m:.4f} ± {sd:.4f}")
 
@@ -241,12 +243,12 @@ def main():
             continue
         rr = val["random"]
         aa = val["adaptive"]
-        for k in ("frag_acc", "res_exact", "coverage", "rmsd_all", "rmsd_matched", "clash"):
+        for k in ("frag_acc", "res_exact", "res_relaxed", "coverage", "rmsd_all", "rmsd_matched", "clash"):
             deltas[k].append(float(aa[k]) - float(rr[k]))
 
     if len(deltas) > 0 and len(deltas["frag_acc"]) > 0:
-        print("\n配对差值 (adaptive - random):")
-        for k in ("frag_acc", "res_exact", "coverage", "rmsd_all", "rmsd_matched", "clash"):
+        print("\n配稳差值 (adaptive - random):")
+        for k in ("frag_acc", "res_exact", "res_relaxed", "coverage", "rmsd_all", "rmsd_matched", "clash"):
             m, sd = agg(deltas[k])
             print(f"  {k:12s}: {m:+.4f} ± {sd:.4f}")
 

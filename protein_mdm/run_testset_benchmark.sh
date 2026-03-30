@@ -15,7 +15,7 @@ set -e
 # 配置参数
 # =========================
 MODEL_PATH="checkpoints_20000_0328/best_model.pt"
-TEST_LIST="data/cache_20000/test.txt"
+TEST_LIST="data/cache_20000/train.txt"
 RAW_DATA_DIR="raw_data"
 OUTPUT_CSV="testset_benchmark_final.csv"
 MAX_SAMPLES=20  # 可修改为 20~50 用作小批测试，当前默认跑完所有

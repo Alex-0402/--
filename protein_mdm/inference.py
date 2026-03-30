@@ -371,8 +371,24 @@ def main():
         per_res_match = np.array([int(p == g) for p, g in zip(pred_per_res, gt_per_res)], dtype=np.int32)
         residue_type_match_rate = float(per_res_match.mean()) if len(per_res_match) > 0 else float('nan')
 
+        # === 引入松弛匹配计算 (Relaxed Match) ===
+        try:
+            from scripts.evaluate_relaxed import calculate_relaxed_aar
+            relax_results = calculate_relaxed_aar(
+                pred_per_res=pred_per_res,
+                gt_per_res=gt_per_res,
+                true_residue_types=residue_types,
+                vocab_residue_map=vocab._residue_to_fragments_map,
+                threshold=0.65  # 相似度阈值放宽一些
+            )
+            relaxed_match_rate = relax_results['relaxed_acc']
+        except Exception as e:
+            relaxed_match_rate = float('nan')
+
         print(f"   Fragment Token Acc: {frag_token_acc:.4f}")
-        print(f"   Residue侧链类型一致率(Exact): {residue_type_match_rate:.4f}")
+        print(f"   Residue侧链严格一致率(Strict Exact): {residue_type_match_rate:.4f}")
+        if not np.isnan(relaxed_match_rate):
+            print(f"   Residue模糊投射恢复率(Relaxed AAR): {relaxed_match_rate:.4f} ✨")
         print(f"   Torsion Bin Acc: {torsion_bin_acc:.4f}")
         print(f"   全局 Torsion MAE (含错片): {torsion_mae_deg:.2f}°")
         print(f"   条件 Torsion MAE (仅对片): {cond_torsion_mae_deg:.2f}°")
@@ -438,6 +454,7 @@ def main():
             'strategy': strategy_name,
             'frag_token_acc': float(frag_token_acc),
             'residue_exact': float(residue_type_match_rate),
+            'residue_relaxed': float(relaxed_match_rate) if not np.isnan(relaxed_match_rate) else float('nan'),
             'torsion_bin_acc': float(torsion_bin_acc),
             'torsion_mae_deg': float(torsion_mae_deg),
             'clash': float(clash_score),
@@ -467,11 +484,13 @@ def main():
 
         if len(all_results) > 1:
             print("\n6. 策略对比汇总")
-            print("   " + "-" * 64)
+            print("   " + "-" * 85)
             for r in all_results:
+                rlx_str = f"{r.get('residue_relaxed', 0.0):.4f}"
                 print(
                     f"   {r['strategy']:<8} | FragAcc={r['frag_token_acc']:.4f} | "
-                    f"ResExact={r['residue_exact']:.4f} | Coverage={r['coverage']:.4f} | "
+                    f"Strict={r['residue_exact']:.4f} | RlxAAR={rlx_str} | "
+                    f"Coverage={r['coverage']:.4f} | "
                     f"RMSD_all={r['rmsd_all']:.4f} | RMSD_matched={r['rmsd_matched']:.4f} | "
                     f"Clash={r['clash']:.4f}"
                 )
